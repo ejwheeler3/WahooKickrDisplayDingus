@@ -1,6 +1,6 @@
 /*********************************************************************************************************
 * Wahoo Kickr SmartBike Display Dingus
-* Jay Wheeler Last Update: 12/23/2023
+* Jay Wheeler Last Update: 12/24/2023
 *
 * Displays gears, grade, power in watts or W/KG and Power Zone info on a LILYGO T-Display-S3 ESP32-S3.
 *
@@ -16,14 +16,19 @@
 
 Known Bugs:
 + tilt lock / grade does not display correctly until the lock is toggled on the bike
-+ front chain ring should go to red when ratio is 1 to 1
 
 To Do:
 + add power smoothing 
-+ line add distinguishing lines between fields New Line 
 + calculate max and average power, % of ftp, display somewhere in small font
 + dynamically set number of gears
 
+Change Log:
+12/24/2023 - removed or commented out the bulk of the serial debug statements, as it came to my attention
+            that these really slow down program execution.  Left only those tied to the initial handshake.
+            Move the gearing graphic closer to the upper left corner, and moving the gearing text over.
+            Further tightened up the horizontal spacing of  gear graphic.  Fixed the code to display both
+            front and rear gear in red when out of gears.  Cleaned up the gear code somewhat. 
+            Added vertical and horizontal dividers between the various fields.
 **********************************************************************************************************/
 
 #include "BLEDevice.h"
@@ -42,6 +47,7 @@ TFT_eSprite img = TFT_eSprite(&tft);
 // 135 x 240 ... LILYGO TTGO T-Display ESP32
 #define RESOLUTION_X 320
 #define RESOLUTION_Y 170
+#define POWERTEXT_Y  68
 // BUTTONs
 #define BOTTOM_BUTTON_PIN 0
 #define TOP_BUTTON_PIN 35
@@ -74,7 +80,7 @@ String currentGrade = ("0.0");
 float currentPower = 0;
 int fg, rg;
 uint8_t arr[32];
-int tilt_lock = 1;
+int tilt_lock = 0;
 int negative = 0;
 int intLastButtonState;
 bool bolToggleScreen = false;
@@ -110,7 +116,7 @@ bool connectToServer() {
     pClient->connect(myDevice);  // if you pass BLEAdvertisedDevice instead of address, it will be recognized type of peer device address (public or private)
     Serial.println(" - Connected to server");
 
-    /*------------------------------------------------------------------------------------------------*/
+    /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     // Obtain a reference to the gearubg service in the remote BLE server.
     BLERemoteService* pRemoteService = pClient->getService(serviceGearingUUID);
     if (pRemoteService == nullptr) {
@@ -139,7 +145,7 @@ bool connectToServer() {
     {
          pRemoteCharacteristic->registerForNotify(notifyCallbackGearing);
     }
-    /*------------------------------------------------------------------------------------------------*/
+    /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     // tilt
     // Obtain a reference to the tilt servicein the remote BLE server.
     pRemoteService = pClient->getService(serviceGradeUUID);
@@ -164,12 +170,12 @@ bool connectToServer() {
       std::string value = pRemoteCharacteristic2->readValue();
       std::copy(value.begin(), value.end(), std::begin(arr));
       Serial.print("currentGrade or lock first read : ");
-      calc_tilt(arr, value.size());
+      calcTileAndLock(arr, value.size());
     }
     if(pRemoteCharacteristic2->canNotify()) {
          pRemoteCharacteristic2->registerForNotify(notifyCallbackGrade);       
     }
-    /*------------------------------------------------------------------------------------------------*/
+    /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     // Power
     // Obtain a reference to the power servicein the remote BLE server.
     pRemoteService = pClient->getService(servicePowerUUID);
@@ -194,18 +200,17 @@ bool connectToServer() {
       std::string value = pRemoteCharacteristic2->readValue();
       std::copy(value.begin(), value.end(), std::begin(arr));
       Serial.print("currentGrade or lock first read : ");
-      calc_tilt(arr, value.size());
+      calcTileAndLock(arr, value.size());
     }
     if(pRemoteCharacteristic3->canNotify()) {
          pRemoteCharacteristic3->registerForNotify(notifyCallbackPower);       
     }
-
-    /*------------------------------------------------------------------------------------------------*/
+    /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     connected = true;
     return true;
 }
 
-/**
+/**------------------------------------------------------------------------------------------------------------------------
  * Scan for BLE servers and find the first one that advertises the service we are looking for.
  */
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
@@ -215,15 +220,12 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) {
     Serial.print("BLE Advertised Device found: ");
     Serial.println(advertisedDevice.toString().c_str());
-
     // We have found a device, let us now see if it contains the service we are looking for.
     if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceGearingUUID)) {
-
       BLEDevice::getScan()->stop();
       myDevice = new BLEAdvertisedDevice(advertisedDevice);
       doConnect = true;
       doScan = true;
-
     } // Found our server
   } // onResult
 }; // MyAdvertisedDeviceCallbacks
@@ -241,7 +243,7 @@ void setup() {
   tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
   tft.drawString("Wahoo Kickr Display Dingus", 0, 0, 4);
   tft.drawString("Gear/Grade/Power Display", 0, 52, 4);
-  tft.drawString("Jay Wheeler Dec 23, 2023", 0, RESOLUTION_Y - 16, 2);
+  tft.drawString("Jay Wheeler Dec 24, 2023", 0, RESOLUTION_Y - 16, 2);
   tft.drawString("Connecting....", 0, 78, 4);
 
   // Retrieve a Scanner and set the callback we want to use to be informed when we
@@ -254,9 +256,10 @@ void setup() {
   pBLEScan->setActiveScan(true);
   pBLEScan->start(5, false);
 
-  img.createSprite(RESOLUTION_X, RESOLUTION_Y);
+  img.createSprite(RESOLUTION_X, RESOLUTION_Y);  // will be used for screen updates, prevents flicker
 } // End of setup.
 
+/*========================================================================================================================*/
 void loop() {
 
   // If the flag "doConnect" is true then we have scanned for and found the desired
@@ -280,35 +283,32 @@ void loop() {
   // with the current time since boot.
   if (connected) {
       String newValue = "Time since boot: " + String(millis()/1000);
-  //  Serial.println("Setting new characteristic value to \"" + newValue + "\"");
-    
      // Set the characteristic's value to be the array of bytes that is actually a string.
     pRemoteCharacteristic->writeValue(newValue.c_str(), newValue.length());
-
     updateDisplayViaSprite();
-    
 
-    
   }else if(doScan){
     BLEDevice::getScan()->start(0);  // this is just eample to start scan after disconnect, most likely there is better way to do it in arduino
   }
-  
   delay(100); // Delay a 1/10 second
 } // End of loop
-
+/*========================================================================================================================*/
 void updateDisplayViaSprite(){
   // the subroutines below update a screen sized "sprite" - the actual update to the physical screen
   // happens in one step at the end of this routine - this gets rid of flicker
   checkButtonState();
   img.drawString( String(int(millis()/1000)) , 0, 150, 2); // but the time since boot in lower left corner in tiny type
-  update_gear();
-  update_grade();
-  update_front();
-  update_rear();
-  update_power();
+  updateGearText();
+  updateGrade();
+  updateFrontGearGraphic();
+  updateRearGearGraphic();
+  updatePower();
+  img.fillRect(RESOLUTION_X/2-8, 0,2, RESOLUTION_Y, TFT_DARKGREY); // draw a vertical divider
+  img.fillRect(RESOLUTION_X/2-8, (POWERTEXT_Y) - 4, (RESOLUTION_X/2) + 8 - 20, 2, TFT_DARKGREY); // draw a horizontal divider
+  img.fillRect(RESOLUTION_X - 21, 0, 1 , RESOLUTION_Y, TFT_DARKGREY); // draw a horizontal divider
   img.pushSprite(0,0);  // update the physical screen
 }
-
+/* end void loop()---------------------------------------------------------------------------------------------------------*/
 void checkButtonState() {
   int intButtonState = digitalRead(BOTTOM_BUTTON_PIN);
   if (intLastButtonState != intButtonState)
@@ -317,8 +317,6 @@ void checkButtonState() {
     delay(50);
     if (intButtonState == LOW)
     {
-      // Press Action
-      // Toggle Button State
       bolToggleScreen = !bolToggleScreen;
     }
     else
@@ -328,11 +326,11 @@ void checkButtonState() {
     intLastButtonState = intButtonState;
   }
 }
-
-void update_front(void)
+/* end void checkButtonState()-----------------------------------------------------------------------------------*/
+void updateFrontGearGraphic(void)
 {
-  static int pre_pos = -1;
-  if(pre_pos == fg) return;
+  //static int pre_pos = -1;
+  //if(pre_pos == fg) return;
 
   uint32_t fillColor = TFT_GREEN;
   if (frontgear == "1" && reargear == "1") {
@@ -340,52 +338,42 @@ void update_front(void)
     fillColor = TFT_RED;
   }
   if(fg == 1) {
-    img.fillRect(10, 70, 5, 50, fillColor);
-    img.fillRect(17, 60, 5, 70, TFT_BLACK);
-    img.drawRect(17, 60, 5, 70, TFT_WHITE);
+    img.fillRect(10, 20, 5, 50, fillColor);
+    img.fillRect(17, 10, 5, 70, TFT_BLACK);
+    img.drawRect(17, 10, 5, 70, TFT_WHITE);
   }
   else{
-    img.fillRect(10, 70, 5, 50, TFT_BLACK);
-    img.drawRect(10, 70, 5, 50, TFT_WHITE);
-    img.fillRect(17, 60, 5, 70, fillColor);
+    img.fillRect(10, 20, 5, 50, TFT_BLACK);
+    img.drawRect(10, 20, 5, 50, TFT_WHITE);
+    img.fillRect(17, 10, 5, 70, fillColor);
   }
-  pre_pos = fg;
+  //pre_pos = fg;
 }
-
-void clear_cassette(int i)
-{
-  i--;
-   img.fillRect(35 + i*6, 60 + i*2, 5, 70 - i*4, TFT_BLACK);
-   img.drawRect(35 + i*6, 60 + i*2, 5, 70 - i*4, TFT_WHITE);
-}
-
+/*------------------------------------------------------------------------------------------------------------*/
 void fill_cassette(int i)
 {
   i--;
 
   if (frontgear == "1" && reargear == "1") {
     // we are out of gears
-    img.fillRect(35 + i*6, 60 + i*2, 5, 70 - i*4, TFT_RED);
+    img.fillRect(35 + i*5, 10 + i*2, 5, 70 - i*4, TFT_RED);
   } else {
-    img.fillRect(35 + i*6, 60 + i*2, 5, 70 - i*4, TFT_GREEN);
+    img.fillRect(35 + i*5, 10 + i*2, 5, 70 - i*4, TFT_GREEN);
   }
 }
-void update_rear(void)
+/*------------------------------------------------------------------------------------------------------------*/
+void updateRearGearGraphic(void)
 {
-  static int pre_rg = -1;
-  if(pre_rg == -1)
-  {
-    for(int i = 0 ; i < 12 ; i++)
+    for(int i = 0 ; i < 12 ; i++){
       //img.drawRect(40 + i*10,60 + i*2,5,70 - i*4, TFT_WHITE);
-      img.drawRect(35 + i*6,60 + i*2,5,70 - i*4, TFT_WHITE);
-    pre_rg = 3;
-  }  
-  clear_cassette(pre_rg);
+      //img.drawRect(35 + i*5,10 + i*2,5,70 - i*4, TFT_WHITE);
+      img.fillRect(35 + i*5, 10 + i*2, 5, 70 - i*4, TFT_BLACK);
+      img.drawRect(35 + i*5, 10 + i*2, 5, 70 - i*4, TFT_WHITE);
+    }
   fill_cassette(rg); 
-  pre_rg = rg;
 }
-
-void update_gear(void){
+/*------------------------------------------------------------------------------------------------------------*/
+void updateGearText(void){
 
   String gearRatio = String(frontgear) + ":" + String(reargear) + "   ";
 
@@ -394,11 +382,11 @@ void update_gear(void){
     img.setTextColor(TFT_RED, TFT_BLACK);
   }
 
-  img.drawString(gearRatio, 0, 0, 4);  
+  img.drawString(gearRatio, 80, 0, 4);  
   img.setTextColor(TFT_SKYBLUE, TFT_BLACK);
 }
-
-void update_grade(void) {
+/*------------------------------------------------------------------------------------------------------------*/
+void updateGrade(void) {
   // if the bike is locked, display that in red, otherwise display the grade
   if (tilt_lock) {
     img.fillRect(RESOLUTION_X/2, 0, RESOLUTION_X - int(RESOLUTION_X/2), int(RESOLUTION_X/2), TFT_BLACK);
@@ -413,9 +401,8 @@ void update_grade(void) {
       img.drawString("% Grade", 240, 50, 2);
     }
 }
-
-
-void update_power(void) {
+/*------------------------------------------------------------------------------------------------------------*/
+void updatePower(void) {
  
       //figure out power zone, based on algorithm from cyclistshub.com
       String powerZone = "--";
@@ -463,16 +450,15 @@ void update_power(void) {
 
       img.setTextColor(zChartColor, TFT_BLACK);
       
-      Serial.println("powerZone:" + powerZone + " currentPower:" + String(currentPower));
-      img.fillRect(RESOLUTION_X/2, 70, RESOLUTION_X - RESOLUTION_X/2, RESOLUTION_Y - 70, TFT_BLACK);
+      //Serial.println("powerZone:" + powerZone + " currentPower:" + String(currentPower));
+      img.fillRect(RESOLUTION_X/2, POWERTEXT_Y, RESOLUTION_X - RESOLUTION_X/2, RESOLUTION_Y - POWERTEXT_Y, TFT_BLACK);
 
       float scalingFactor = RESOLUTION_Y / (1.5 * FTP);
       int chartHeight = int(scalingFactor * currentPower);
       chartHeight = min(RESOLUTION_Y, chartHeight);
       chartHeight = max(1, chartHeight); // in case power is zero
 
-      Serial.println("ChartHeight:" + String(chartHeight));
-
+      // deal with the ftp power bar display on the far right
       img.fillRect(RESOLUTION_X - 20, 0, 20, RESOLUTION_Y, TFT_BLACK);
       img.fillRect(RESOLUTION_X - 20, RESOLUTION_Y - chartHeight, 20, chartHeight, zChartColor);
 
@@ -480,12 +466,10 @@ void update_power(void) {
       img.drawString(powerDesc, RESOLUTION_X/2, RESOLUTION_Y-20, 2);
       // Button Toggle
       char buffer[7];
-      
-      
       if (bolToggleScreen) {
         //Watts mode
         dtostrf(currentPower, 5,0,buffer);
-        Serial.println("Buffer:" + String(buffer) + ":");
+        //Serial.println("Buffer:" + String(buffer) + ":");
         img.drawString(String(buffer), RESOLUTION_X/2,70, 7);
         img.drawString("Watts",220, 120, 4); 
       }
@@ -495,24 +479,20 @@ void update_power(void) {
         float flPowerToWeight = currentPower/float(WEIGHT);
         //Serial.println("W/KG" + String(flPowerToWeight));
         dtostrf(flPowerToWeight, 5,2,buffer);
-        Serial.println("Buffer:" + String(buffer) + ":");
+        //Serial.println("Buffer:" + String(buffer) + ":");
         img.drawString(String(buffer), RESOLUTION_X/2,70, 7);
         img.drawString("W/KG",220, 120, 4);
       }
   img.setTextColor(TFT_SKYBLUE, TFT_BLACK);
-  
 }
-
-void calc_tilt(uint8_t *pData, size_t length){
-
-  
-  for (int i = 0; i < length; i++) {
-
+/*------------------------------------------------------------------------------------------------------------*/
+void calcTileAndLock(uint8_t *pData, size_t length){
+  /*for (int i = 0; i < length; i++) {
     Serial.print(pData[i], HEX);
     Serial.print(" "); //separate values with a space
   }
   Serial.println("");
-
+  */
     //lock, unlock update
   if(length == 3 && pData[0] == 0xfd && pData[1] == 0x33) {
     tilt_lock = pData[2] == 0x01;
@@ -525,50 +505,50 @@ void calc_tilt(uint8_t *pData, size_t length){
     {
       negative = 0; 
       float tmp = (float)(pData[3] << 8 | pData[2]) / 100;
-      Serial.println(tmp);
-      sprintf(s, "+ %.1f %%", tmp); 
+      //Serial.println(tmp);
+      sprintf(s, "+%.1f", tmp);  // I don't add a % sign, as the larger fonts can't show tht symbol
       currentGrade = s;
-      Serial.println(currentGrade);
+      //Serial.println(currentGrade);
     }
     else
     {
       negative = 1;
       uint16_t tmp16 = 0xffff - (pData[3] << 8 | pData[2]);
       float tmp = (float)tmp16 / 100;
-      Serial.println(tmp16);
-      Serial.println(tmp);
-      sprintf(s, "- %.1f %%",tmp);
+      //Serial.println(tmp16);
+      //Serial.println(tmp);
+      sprintf(s, "-%.1f",tmp);
       currentGrade = s;
-      Serial.println(currentGrade);
+      //Serial.println(currentGrade);
     }
   }
-
 }
-
-
+/*-------------------------------------------------------------------------------------------------------------
+  These last sections handle the callbacks when bluetooth sends an updated power, grade, lock or gearing update
+  Bad idea to have serial outputs in these routines, as these get called constantly and the serial write is 
+  slow.    If you turn on debug output, turns them back off when finished.
+------------------------------------------------------------------------------------------------------------*/
 static void notifyCallbackPower(BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify)
 {
   uint16_t tmp16 = (pData[3] << 8 | pData[2]);
   currentPower = (float)(tmp16);
 }
-
+/*------------------------------------------------------------------------------------------------------------*/
 static void notifyCallbackGrade(
   BLERemoteCharacteristic* pBLERemoteCharacteristic2,
   uint8_t* pData,
   size_t length,
   bool isNotify) {
 
-  Serial.print("noty2 : ");
+  //Serial.print("noty2 : ");
   /*for(int i=0; i < length; i++) {
     Serial.print(String(i)+":");
     Serial.println(String(pData[i]));
   }*/
 
-  calc_tilt(pData, length); 
+  calcTileAndLock(pData, length); 
 }
-
-
-
+/*------------------------------------------------------------------------------------------------------------*/
 static void notifyCallbackGearing(
   BLERemoteCharacteristic* pBLERemoteCharacteristic,
   uint8_t* pData,
@@ -588,6 +568,5 @@ static void notifyCallbackGearing(
 
   fg = (int)(1+pData[2]);
   rg = (int)(1+pData[3]);
-
 }
-
+/*------------------------------------------------------------------------------------------------------------*/
