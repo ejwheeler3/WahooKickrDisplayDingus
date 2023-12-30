@@ -483,23 +483,23 @@ void checkButtons() {
         // toggle watts or w/kg
         intWattsOrWKG++;
         if (intWattsOrWKG > 1) intWattsOrWKG = 0;
+        // uncomment the following line if you want to persistently save power mode and watts/wkg changes each time they
+        // are made - but be aware that ESP32 manufacturer only claims 10,000 writes - if you fiddle with these setting
+        // throughout your rides, say, 10x per ride, and ride daily, you would only be looking at 3 years before you reach that 10k
+        // otherwise, whatever settings are in effect for power mode and watts vs w/kg get save when you update your ftp / weight
+        // saveEEPROMSettings()  
         delay(50); // only want this for normal mode, in input mode, we want a held button to register
       } 
       if (inputMode == inputWeightMode) { 
         // decrease weight
         inputWeightKGs--;
         inputWeightKGs = max(inputWeightKGs, minWeight);
-        // uncomment the following line if you want to persistently save power mode and watts/wkg changes each time they
-        // are made - but be aware that ESP32 manufacturer only claims 10,000 writes - if you fiddle with these setting
-        // throughout your rides, say, 10x per ride, and ride daily, you would only be looking at 3 years before you reach that 10k
-        // otherwise, whatever settings are in effect for power mode and watts vs w/kg get save when you update your ftp / weight
-        // saveEEPROMSettings()  
+
       }
       if (inputMode == inputFTPMode) {
         //decrease ftp
         inputFTP = inputFTP - 5;
         inputFTP = max(inputFTP, minFTP);
-        // saveEEPROMSettings() // see comment above
       }
     }
         
@@ -509,19 +509,18 @@ void checkButtons() {
         // rotate instant, 3s or 10s power
         powerAvgMode++;
         if (powerAvgMode > 2) powerAvgMode = 0;
+        // saveEEPROMSettings() // see comment above
         delay(50);  // only want this for normal mode, in input mode, we want a held button to register
       }
       if (inputMode == inputWeightMode){
         // increase weight
         inputWeightKGs++;
         inputWeightKGs = min(inputWeightKGs, maxWeight);
-        // saveEEPROMSettings() // see comment above
       } 
       if (inputMode == inputFTPMode){
         // increase ftp
         inputFTP = inputFTP + 5;
         inputFTP = min(inputFTP, maxFTP);
-        // saveEEPROMSettings() // see comment above
       }
     }
   } // end single or no buttom press
