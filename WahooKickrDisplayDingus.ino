@@ -1,4 +1,6 @@
-# define cVERSION "20231229"
+# define cVERSION "20240107"
+# define demoMode false // true or false, if true put dingus in a demo loop, and will not care if kickr is available
+
 // Check and set the default values for rider Weight in Kilograms, FTP in watts - enter FTP in increments of 5!
 // These defaults can be changed and saved directly thru the Dingus interface
 // by pressing both buttons at once and following the prompts.   Those changes
@@ -60,6 +62,21 @@ Change Log:
           time the user toggle power mode or watts vs W/KG - but on furhter reading, learned that ESP32 only guarantees
           10,000 to 100,000 write cycles to the flash memory - plenty for the user to update weight/ftp, but perhaps a problem
           if the user constantly toggles power modes.
+12/31/2023 - factored / simplified the power code using arrays.
+          Enhanced the power chart with zone markers, markers for avg and max power.
+          Max / Avg power in stats now color codes based on zone, and toggles between watts / wkg like the main power display
+          Improved the demo loop.
+          Changed the power zone thresholds to match Zwift, including color coding.   Added option for Rouvy power zones.
+01/03/2024 - the power model toggle now include % FTP - so it cycles based on the bottom button from Watts, WKg, % FTP. 
+           -checks that settings have actually changed before writing to eeprom.
+           - added logic to prevent accidentally cycling from the last input setting screen directly back into the first
+           - added logic that detects when no power input (presumably you are coasting or finished cycling) has been
+             received for three seconds, and when that happens, toggles a summary screen with max and avg power 
+             (in your choice of Watts/WKg/% FTP) in large print.  Regular display resumes when you start pedaling.
+01/07/2024 - extended logic to keep track of max and avg for instant, 3 second and 10 second.  Reorganized screen layout to put the
+             power chart in the center, gear graphic in the lower left, grade in the upper left and power plus avg/max as the entire
+             right side.
+
 **********************************************************************************************************/
 
 #include "BLEDevice.h"
@@ -71,8 +88,6 @@ TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h
 // define a sprite to cover the whole screen, avoids flickr - s
 TFT_eSprite imgSprite = TFT_eSprite(&tft);
 
-
-#define POWERTEXT_Y  68
 // BUTTONs
 #define BOTTOM_BUTTON_PIN 0
 #define TOP_BUTTON_PIN 14
@@ -97,7 +112,7 @@ static BLERemoteCharacteristic* pRemoteCharacteristic2;
 static BLERemoteCharacteristic* pRemoteCharacteristic3;
 static BLEAdvertisedDevice* myDevice;
 float currentGrade = 0;
-float currentPower = 0;
+int currentPower = 0;
 int currentChainRing = 1;
 int currentCassette = 1;
 int numFrontGears = 1;
@@ -105,12 +120,20 @@ int numRearGears = 1;
 
 uint8_t arr[32];
 int tilt_lock = 0;
-int intWattsOrWKG = 0; // 0 = watts, 1 = W/KG
-int  powerAvgMode = 1; // 0 = instant 1 = 3s, 2 = 10s
-long maxPower = 0;
-long powerObservations = 0;
-float powerCumulativeTotal = 0;
+#define powerWatts 0
+#define powerWKG 1
+#define powerFTP 2
+int intWattsOrWKgOrFTP = powerWatts; // 0 = watts, 1 = W/KG, 2 = FTP
+#define avgInstant 0
+#define avg3Secs 1
+#define avg10Secs 2
+int  powerAvgMode = avg3Secs; // 0 = instant 1 = 3s, 2 = 10s
+int maxPowerArray[3]; // keep track of max power for instant, 3s and 10s
+long powerObservationsArray[3];
+float powerCumulativeTotalArray[3];
+
 long lastPowerObservationSecond = 0;
+long lastNonZeroPower = 0;
 long intraSecondObservations = 0;
 long intraSecondCumulativeTotal = 0;
 #define maxSecsToAvg 12
@@ -127,6 +150,20 @@ int inputFTP = defaultFTP;
 #define minFTP 50
 #define maxFTP 500
 
+
+// FTP Power Zone Stuff
+// power zones, based on Zwift - see https://zwiftinsider.com/power-zone-colors
+#define numPowerZones 6
+int powerZoneThreshold[numPowerZones] = {0, 59, 75, 89, 104, 118};
+String powerZoneDescription[numPowerZones] = {"Z1 Active Recovery", "Z2 Endurance", "Z3 Tempo", "Z4 Lactate Threshold", "Z5 VO2 Max", "Z6 Anaerobic "};
+uint32_t powerZoneColor[numPowerZones] = {TFT_LIGHTGREY,TFT_BLUE,TFT_GREEN,TFT_YELLOW,TFT_ORANGE,TFT_RED};
+
+// if you want to use Rouvy zones, uncomment the following, and comment out the zwift definitions above
+// power zones based on Rouvy - see https://support.rouvy.com/hc/en-us/articles/360018830597-Power-Zones
+//#define numPowerZones 7
+//int powerZoneThreshold[numPowerZones] = {0, 55, 75, 90, 105, 120, 150};
+//String powerZoneDescription[numPowerZones] = {"Z1 Active Recovery", "Z2 Endurance", "Z3 Tempo", "Z4 Lactate Threshold", "Z5 VO2 Max", "Z6 Anaerobic ", "Z7 Neuromuscular"};
+//uint32_t powerZoneColor[numPowerZones] = {TFT_PURPLE,TFT_BLUE,TFT_CYAN,TFT_GREEN,TFT_GREENYELLOW,TFT_ORANGE,TFT_RED};
 
 
 /***************************************************************************************************************************
@@ -285,9 +322,12 @@ void setup() {
   pinMode(TOP_BUTTON_PIN, INPUT_PULLUP);
 
     // init tracking structure for avg power
-  for (int i = 0; i++; i < maxSecsToAvg){
+  for (int i = 0; i < maxSecsToAvg; i++){
     avgBySecond[i] = 0;
   }
+  // init max power array
+  for (int i = 0; i < 3; i++) maxPowerArray[i] = 0;
+
   BLEDevice::init("");
   tft.init();
   tft.setRotation(1);
@@ -316,29 +356,7 @@ void setup() {
   imgSprite.createSprite(RESOLUTION_X, RESOLUTION_Y);  // will be used for screen updates, prevents flicker
 } // End of setup.
 
-void restoreEEPROMSettings(){
-  // these two are safe to read even on a virgin board, as 0 is a valid state
-  powerAvgMode = EEPROM.read(0);
-  intWattsOrWKG = EEPROM.read(1);
-  // weight and ftp can be in the range 25 to 500, which is too big for one byte, so...
-  inputWeightKGs = EEPROM.read(2);
-  if (inputWeightKGs < minWeight ) inputWeightKGs = defaultWEIGHT;
-  if (inputWeightKGs > maxWeight ) inputWeightKGs = defaultWEIGHT;
-  inputFTP = EEPROM.read(3) * 5;
-  if (inputFTP < minFTP) inputFTP = defaultFTP;
-  if (inputFTP > maxFTP) inputFTP = defaultFTP;
 
-}
-void saveEEPROMSettings(){
-  EEPROM.write(0,powerAvgMode);
-  EEPROM.write(1,intWattsOrWKG);
-  EEPROM.write(2,inputWeightKGs);
-  // FTP must in be increments of 5
-  // which allows dividing by 5, which will fit any reasonable
-  // FTP value into a byte - these locations are only 8 bits
-  EEPROM.write(3,int(inputFTP/5));
-  EEPROM.commit();
-}
 /*========================================================================================================================*/
 void loop() {
   
@@ -346,23 +364,35 @@ void loop() {
   // test graphics - change condition to 1 == 1 in the following and run the sketch with your kickr bike off to exercise the graphics
   // essentially a demo mode
 
-  if (0 == 1) {
+  if (demoMode) {
+    Serial.println("Top of demo loop");
     numFrontGears = 2;
     numRearGears = 11;
-    currentPower = 100;
+
+    
+    //currentPower = 50;
     for (int fg = 1; fg < 3; fg++) {
       for (int rg = 1; rg < 12; rg++) {
         currentChainRing = fg;
         currentCassette = rg;
         numFrontGears = 2;
         numRearGears = 11;
-        currentPower++;
-        powerCumulativeTotal= 1000;
-        powerObservations = 7;
-        if (currentPower == 200) currentPower = 100;
-        avgBySecond[0] = currentPower;
-        avgBySecond[1] = currentPower + 5;
-        avgBySecond[2] = currentPower + 10;
+        if (rg % 2 == 0) {
+          currentPower += 30;
+        } else {
+          currentPower -= 15;
+        }
+        if (currentPower > int(1.6 * inputFTP)) currentPower = 50;
+        maxPowerArray[avgInstant] = max(int(maxPowerArray[avgInstant]),int(currentPower));
+        maxPowerArray[avg3Secs] = int(maxPowerArray[avgInstant] * 0.9);
+        maxPowerArray[avg10Secs] = int(maxPowerArray[avgInstant] * 0.82);
+        powerCumulativeTotalArray[avgInstant]= 1000;
+        powerObservationsArray[avgInstant] = 7;
+        powerCumulativeTotalArray[avg3Secs]= 900;
+        powerObservationsArray[avg3Secs] = 7;
+        powerCumulativeTotalArray[avg10Secs]= 850;
+        powerObservationsArray[avg10Secs] = 7;
+        for (int i = 0; i < 10; i++) avgBySecond[i] = currentPower + 2;
         currentGrade = rg; // why not?
         checkButtons();
         updateDisplayViaSprite();
@@ -381,7 +411,7 @@ void loop() {
       tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
       if (connectToServer()) {
         //Serial.println("We are now connected to the BLE Server.");
-        tft.drawString("Wahoo Services Connected.", 0, 78, 4);
+        tft.drawString("Wahoo Services Connected.", 0, 100, 4);
         //tft.drawXBitmap(155, 0, zwiftlogo, 100, 100, TFT_BLACK, TFT_ORANGE);  
         delay(1000);
         tft.fillScreen(TFT_BLACK);
@@ -411,11 +441,47 @@ void loop() {
   } // normal loop
 } // End of loop
 /*========================================================================================================================*/
+void restoreEEPROMSettings(){
+  // these two are safe to read even on a virgin board, as 0 is a valid state
+  powerAvgMode = EEPROM.read(0);
+  intWattsOrWKgOrFTP = EEPROM.read(1);
+  // weight and ftp can be in the range 25 to 500, which is too big for one byte, so...
+  inputWeightKGs = EEPROM.read(2);
+  if (inputWeightKGs < minWeight ) inputWeightKGs = defaultWEIGHT;
+  if (inputWeightKGs > maxWeight ) inputWeightKGs = defaultWEIGHT;
+  inputFTP = EEPROM.read(3) * 5;
+  if (inputFTP < minFTP) inputFTP = defaultFTP;
+  if (inputFTP > maxFTP) inputFTP = defaultFTP;
+}
+/*-------------------------------------------------------------------------------------------------------------------*/
+void saveEEPROMSettings(){
+
+  int oldpowerAvgMode = EEPROM.read(0);
+  int oldintWattsOrWKgOrFTP = EEPROM.read(1);
+  int oldinputWeightKGs = EEPROM.read(2);
+  int oldinputFTP = EEPROM.read(3) * 5;
+
+  if (oldpowerAvgMode != powerAvgMode || oldintWattsOrWKgOrFTP != intWattsOrWKgOrFTP
+      || oldinputWeightKGs != inputWeightKGs || oldinputFTP != inputFTP) {
+        EEPROM.write(0,powerAvgMode);
+        EEPROM.write(1,intWattsOrWKgOrFTP);
+        EEPROM.write(2,inputWeightKGs);
+        // FTP must in be increments of 5
+        // which allows dividing by 5, which will fit any reasonable
+        // FTP value into a byte - these locations are only 8 bits
+        EEPROM.write(3,int(inputFTP/5));
+        EEPROM.commit();
+      }
+}
+/*-------------------------------------------------------------------------------------------------------------------*/
 void updateDisplayViaSprite(){
   // the subroutines below update a screen sized "sprite" - the actual update to the physical screen
   // happens in one step at the end of this routine - this gets rid of flicker
 
   long currentSecond = long(millis()/1000);
+
+  //  NORMAL MODE - not updating ftp or weight
+
   if (currentPower == 0 && currentSecond != lastPowerObservationSecond) {
     updateAvgPowerArray(0);
     lastPowerObservationSecond = currentSecond;
@@ -423,14 +489,25 @@ void updateDisplayViaSprite(){
   // note that the dingus can be in one of three modes - the normal mode, or when both buttons are pressed together
   // the mode to input weight followed by the mode to input FTP
   if (inputMode == inputNormalMode) {
+    
+    setDefaultTextColor();
     imgSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_BLACK);
-    imgSprite.setTextColor(TFT_SKYBLUE, TFT_BLACK);
-    updateGrade();
-    updateGearGraphic();
-    updatePower();
-    updateStats();
-    drawDividers();
+    if (currentSecond > lastNonZeroPower + 3 and ! demoMode) {
+      // it has been at least 3 sconds since the last non-zero power, so show the summary screen
+      
+      updateCoastingStats();
+    } else {
+      // we are cranking away
+      updateGrade();
+      updateGearGraphic();
+      updatePower();
+      //updateStats();
+      drawDividers();
+    }
   }
+
+  // UPDATING WEIGHT MODE
+
   if (inputMode == inputWeightMode) {
     imgSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_DARKGREEN);
     imgSprite.setTextColor(TFT_WHITE, TFT_DARKGREEN);
@@ -440,6 +517,9 @@ void updateDisplayViaSprite(){
     imgSprite.drawString("Press both buttons to move to FTP setting.", 20, 110, 2);
 
   }
+
+    // UPDATING FTP MODE
+
   if (inputMode == inputFTPMode) {
     imgSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_DARKCYAN);
     imgSprite.setTextColor(TFT_WHITE, TFT_DARKCYAN);
@@ -459,30 +539,40 @@ void checkButtons() {
   #define inputWeightMode 1
   #define inputFTPMode 2
   */
+  static long lastInputToggleTime;
+
 
   int intBottomButtonState = digitalRead(BOTTOM_BUTTON_PIN); // watts or w/kg
   int intTopButtonState = digitalRead(TOP_BUTTON_PIN);
 
   // simultaneous button presses - toggles dingus thru the modes for normal uses, ftp input or weight input
-  if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputNormalMode) ) {
-    inputMode = inputWeightMode;
-    delay(50);
-  } else if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputWeightMode) ) {
-    inputMode = inputFTPMode;
-    delay(50);
-  } else if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputFTPMode) ) {
-    // exiting input mode, save state
-    saveEEPROMSettings();
-    inputMode = inputNormalMode;
-    delay(50);
+  if ((intTopButtonState == LOW) && (intBottomButtonState == LOW)) {
+    long currentTime = millis();
+    // make sure it has been at least three seconds since the last toggle between setting inputs, so we don't 
+    // chase out tail immediately toggling back to inputs
+    if (currentTime > lastInputToggleTime + 3000) {
+      lastInputToggleTime = currentTime;
+
+      if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputNormalMode) ) {
+        inputMode = inputWeightMode;
+        delay(50);
+      } else if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputWeightMode) ) {
+        inputMode = inputFTPMode;
+        delay(50);
+      } else if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputFTPMode) ) {
+        // exiting input mode, save state
+        saveEEPROMSettings();
+        inputMode = inputNormalMode;
+        delay(50);
+      }
+    } // currentTime > lastinputToggleTime + 3000
   } else {  //single or no press - meaning depends on mode
     if (intBottomButtonState == LOW)
     {
       if (inputMode == inputNormalMode) {
-        // did use a bool, but switched to int to make saving state clearer
-        // toggle watts or w/kg
-        intWattsOrWKG++;
-        if (intWattsOrWKG > 1) intWattsOrWKG = 0;
+        // toggles thru Watts, W/KG FTP
+        intWattsOrWKgOrFTP++;
+        if (intWattsOrWKgOrFTP > powerFTP) intWattsOrWKgOrFTP = powerWatts;
         // uncomment the following line if you want to persistently save power mode and watts/wkg changes each time they
         // are made - but be aware that ESP32 manufacturer only claims 10,000 writes - if you fiddle with these setting
         // throughout your rides, say, 10x per ride, and ride daily, you would only be looking at 3 years before you reach that 10k
@@ -526,45 +616,74 @@ void checkButtons() {
   } // end single or no buttom press
 }
 /* end void checkButtons()-----------------------------------------------------------------------------------*/
-void updateStats() {
-  // update the stats in the lower left corner, starting with timer since dingus boot
-  //imgSprite.drawString( String(int(millis()/1000)) , 0, 150, 2); // but the time since boot in lower left corner in tiny type
-  // update the small max and average power stats
-  imgSprite.fillRect( 5, 100, RESOLUTION_X/2 - 10, 40, TFT_BLACK);
-  imgSprite.drawString("Max Power: " + String(maxPower), 5, 100, 2);
-  if (powerObservations > 0 ) imgSprite.drawString("Avg Power: " + String(long(powerCumulativeTotal/powerObservations)), 5, 115, 2);
-  imgSprite.drawString("Weight: " + String(inputWeightKGs) + "  FTP: " + String(inputFTP), 5, 130, 2);
-  long secsSinceStart = long(millis()/1000);
-  int hours = int(secsSinceStart / 3600);
-  int minutes = int((secsSinceStart / 60) % 60);
-  int seconds = int(secsSinceStart % 60);
-  char buffer[12];
 
+/*-----------------------------------------------------------------------------------------------------------*/
+void updateCoastingStats() {
+  // draw an outer board based on the max power, with a nested inner border based on the average
+  imgSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, getColorBasedOnFTPPct(100 * maxPowerArray[powerAvgMode] /inputFTP));
+  if (powerObservationsArray[powerAvgMode] > 0) {
+    imgSprite.fillRect(3,3,RESOLUTION_X - 3, RESOLUTION_Y - 3, getColorBasedOnFTPPct(100 * avgDurationPower()/inputFTP));
+  }
+
+  // inset a smaller rectangle
+  imgSprite.fillRect(7, 7, RESOLUTION_X - 14, RESOLUTION_Y - 14, TFT_BLACK);
+  setTextColorBasedOnFTPPct(100 * maxPowerArray[powerAvgMode] /inputFTP);
+  imgSprite.drawString("Max " + getDurationMode() + ": "  + getPowerInSelectedUnits(maxPowerArray[powerAvgMode]) + " " + getWattsOrWKGLabel() , 14, 10, 4);
+
+  setTextColorBasedOnFTPPct(100 * avgDurationPower()/inputFTP);
+  imgSprite.drawString("Avg " + getDurationMode() + ": " + getPowerInSelectedUnits(avgDurationPower()) + " " + getWattsOrWKGLabel(), 14, 50, 4);
+
+  setDefaultTextColor();
+  // pedaling time should always be instant
+  imgSprite.drawString("Pedaling: " + secondsToFormattedTime(powerObservationsArray[avgInstant]), 14, 90, 4);
+  imgSprite.drawString("Weight: " + String(inputWeightKGs) + "  FTP: " + String(inputFTP), 14, 130, 4);
+}
+
+
+/*-------------------------------------------------------------------------------------------------------------------*/
+int avgDurationPower() {
+  // returns the average instant, 3s or 10s power, depending on selected mode.  Returns 0 if no observations yet
+  // for selected mode
+  if (powerObservationsArray[powerAvgMode] == 0) {
+    return 0;
+  } else {
+    return (powerCumulativeTotalArray[powerAvgMode]/powerObservationsArray[powerAvgMode]);
+  }
+
+}
+/*-------------------------------------------------------------------------------------------------------------------*/
+String secondsToFormattedTime(long secs) {
+  int hours = int(secs / 3600);
+  int minutes = int((secs / 60) % 60);
+  int seconds = int(secs % 60);
+  char buffer[12];
   if (hours > 0) {
     sprintf(buffer, "%02d:%02d:%02d", hours, minutes, seconds);
   } else {
     sprintf(buffer, "%02d:%02d", minutes, seconds);
   }
-  imgSprite.drawString("Elapsed Time: " + String(buffer) , 5, 150, 2); // but the time since boot in lower left corner in tiny type
+  return String(buffer);
 }
-/*-------------------------------------------------------------------------------------------------------------------*/
 void drawDividers() {
-  imgSprite.fillRect(RESOLUTION_X/2-8, 0,2, RESOLUTION_Y, TFT_DARKGREY); // draw the middle vertical divider
-  imgSprite.fillRect(RESOLUTION_X/2-8, (POWERTEXT_Y) - 4, (RESOLUTION_X/2) + 8 - 20, 2, TFT_DARKGREY); // draw a right horizontal divider
-  imgSprite.fillRect(RESOLUTION_X - 21, 0, 1 , RESOLUTION_Y, TFT_DARKGREY); // draw a left vertical divider
-  imgSprite.fillRect(0, 96 , (RESOLUTION_X/2) + 8 - 20, 2, TFT_DARKGREY); // draw a left  horizontal divider
+  imgSprite.drawLine(RESOLUTION_X/2 - 10, 0, RESOLUTION_X/2 - 10, RESOLUTION_Y, TFT_DARKGREY); //draw left border of chart
+  imgSprite.drawLine(RESOLUTION_X/2 + 10, 0, RESOLUTION_X/2 + 10, RESOLUTION_Y, TFT_DARKGREY); // draw right border of chart
+  
+  imgSprite.drawLine(0, 68, RESOLUTION_X/2 - 10, 66, TFT_DARKGREY); // draw a left  horizontal divider
+  imgSprite.drawLine(RESOLUTION_X/2 + 10 + 40, 96, RESOLUTION_X - 40, 96, TFT_DARKGREY); // draw a right partial horizontal divider
 }
 /*-------------------------------------------------------------------------------------------------------------------*/
 void updateGearGraphic() {
   // Created 12/25/2023 - displays gears as a side view graphic, rather than top down.
   //              Includes primitive jockey ring animation
   // these should all be even numbers, since they get divided by 2
+  // 1/5/2024 - moved to lower right
+
   #define rearGearX 28
-  #define rearGearY 42
+  #define rearGearY 118 // was 42
   #define rearMinSize 6
   #define rearGearSpacing 1
   #define frontGearX 110
-  #define frontGearY 50
+  #define frontGearY 128 // was 50
   #define frontMinSize  20
   #define frontGearSpacing 10
   #define jockeyWheelSize 4
@@ -577,11 +696,10 @@ void updateGearGraphic() {
   if (currentCassette == 3 && currentChainRing == 1) highLightColor = TFT_YELLOW;
   if (currentCassette == 2 && currentChainRing == 1) highLightColor = TFT_ORANGE;
   if (currentCassette == 1 && currentChainRing == 1) highLightColor = TFT_RED;
-  imgSprite.fillRect(0,0,(RESOLUTION_X/2) - 8, 95, TFT_BLACK);
   //gear text
   imgSprite.setTextColor(highLightColor, TFT_BLACK);
-  imgSprite.drawString(String(currentChainRing) + ":" + String(currentCassette), 0,0, 4);  
-  imgSprite.setTextColor(TFT_SKYBLUE, TFT_BLACK);
+  imgSprite.drawString(String(currentChainRing) + ":" + String(currentCassette), 0, 72, 4);  
+  setDefaultTextColor();
   // rear cassette
   for (int i = numRearGears - 1; i >= 0; i --){
       fillColor = TFT_LIGHTGREY;
@@ -623,13 +741,12 @@ void updateGearGraphic() {
 
 /*------------------------------------------------------------------------------------------------------------*/
 void updateGrade(void) {
+  //Grade moved to upper right corner
   // if the bike is locked, display that in red, otherwise display the grade
   if (tilt_lock) {
-    imgSprite.fillRect(RESOLUTION_X/2, 0, RESOLUTION_X - int(RESOLUTION_X/2), int(RESOLUTION_X/2), TFT_BLACK);
     imgSprite.setTextColor(TFT_RED, TFT_BLACK);
-    imgSprite.drawString("Tilt",int(RESOLUTION_X/2), 0, 4);
-    imgSprite.drawString("Locked",int(RESOLUTION_X/2), 25, 4);
-    imgSprite.drawString("    ", 240, 50, 2);
+    imgSprite.drawString("Tilt",0, 0, 4);
+    imgSprite.drawString("Locked",0, 25, 4);
   } else {
       uint32_t gradeColor = TFT_SKYBLUE;
       if (currentGrade < -2) {
@@ -641,135 +758,251 @@ void updateGrade(void) {
       } else if (currentGrade < 13) {
         gradeColor = TFT_ORANGE;
       } else {
-        // greater than 14
+        // greater than 13
         gradeColor = TFT_RED;
         // may want to add blinking red or other distinguishing
-        // above 18 %?
+        // above 13 %?
       }
       char buffer[7];
       dtostrf(currentGrade, 5,1, buffer);
-      imgSprite.fillRect(RESOLUTION_X/2, 0, RESOLUTION_X - int(RESOLUTION_X/2), int(RESOLUTION_X/2), TFT_BLACK);
       imgSprite.setTextColor(gradeColor, TFT_BLACK);
-      imgSprite.drawString(String(buffer), int(RESOLUTION_X/2), 0, 7);
-      imgSprite.drawString("% Grade", 240, 50, 2);
+      imgSprite.drawString("% Grade", 0, 0, 2);
+      imgSprite.drawString(String(buffer), 0, 16, 7);
+      
     }
-  imgSprite.setTextColor(TFT_SKYBLUE, TFT_BLACK); // reset text color
+  setDefaultTextColor(); // reset text color
 }
 /*------------------------------------------------------------------------------------------------------------*/
 void updatePower(void) {
-
-      float p;
-      imgSprite.fillRect(RESOLUTION_X/2, POWERTEXT_Y, RESOLUTION_X - RESOLUTION_X/2, RESOLUTION_Y - POWERTEXT_Y, TFT_BLACK);
+    // moved to upper left
       
-      String unitPrefix = "Inst.  ";
-      p = currentPower;
-      if (powerAvgMode == 1) {
-        unitPrefix = "3s  ";
-        p = (avgBySecond[0] + avgBySecond[1] + avgBySecond[2])/3;
-      } else if (powerAvgMode == 2) {
-        unitPrefix = "10s  ";
-        // this is ugly, but for loop addition was causing problems for some reason...
-        p = (avgBySecond[0] + avgBySecond[1] + avgBySecond[2] + avgBySecond[3] + avgBySecond[4] + avgBySecond[5] + avgBySecond[6] + avgBySecond[7] + avgBySecond[8] + avgBySecond[9])/10;
-      }
-
-      //figure out power zone, based on algorithm from cyclistshub.com
-      String powerZone = "--";
-      String powerDesc = "--";
-
-      uint32_t zChartColor = TFT_DARKGREEN;
-    
-      float flPercent = 100 * p / float(inputFTP);
-      // note that in the switch logic below, I pad out the powerDesc string to 19
-      // places - this allows it to redraw without artifacts and without resorting
-      // to fillRect() approach, which causes flickering
-      if (flPercent > 150) {
-        powerZone = "Z7"; // 
-        powerDesc = "Neuromuscular Power";
-        zChartColor = 0xF8C0; // red
-      } else if (flPercent > 120) {
-        powerZone = "Z6"; //
-        powerDesc = "Anaerobic Capacity";
-        zChartColor = 0xEC00; // yellow red
-      } else if (flPercent > 105) {
-        powerZone = "Z5";  // 
-        powerDesc = "VO2 Max";
-        zChartColor = 0xF740; // Yellow
-      } else if (flPercent > 90) {
-        powerZone = "Z4"; // 
-        powerDesc = "Lactate Threshold";
-        zChartColor = 0xB6A0; // Yellow Green
-      } else if (flPercent > 75) {
-        powerZone = "Z3"; // 
-        powerDesc = "Tempo";
-        zChartColor = 0x0EE0; // Brighter green
-      } else if (flPercent > 55) {
-        powerZone = "Z2"; // 
-        powerDesc = "Endurance";
-        zChartColor = 0x0707; // light green
-      } else if (flPercent > 0) {
-        powerZone = "Z1"; // 
-        powerDesc = "Active Recovery";
-        zChartColor = 0x077D; // blue green
+      
+      String unitPrefix = getDurationMode();
+      int p;
+      p = 0;
+      if (powerAvgMode == avg3Secs) {
+        for (int i = 0; i < 3; i++) p = p + avgBySecond[i];
+        p = p / 3;
+      } else if (powerAvgMode == avg10Secs) {
+        for (int i = 0; i < 10; i++) p = p + avgBySecond[i];
+        p = p / 10;
       } else {
-        powerZone = "";
-        powerDesc = "Coasting/Stopped";
-        zChartColor = TFT_DARKGREY;
+        // instant power
+        p = currentPower;
       }
+      // convert whichever type of power is being displayed to FTP percent      
+      int ftpPct = int((100 * p) / inputFTP);
+      String powerDesc = getPowerZoneDesc(ftpPct);
+      setTextColorBasedOnFTPPct(ftpPct);
+      imgSprite.drawString(powerDesc, RESOLUTION_X/2 + 18, 0, 2);
 
-      imgSprite.setTextColor(zChartColor, TFT_BLACK);
-      
-      //Serial.println("powerZone:" + powerZone + " p:" + String(p));
-      
-
-      float scalingFactor = RESOLUTION_Y / (1.5 * inputFTP);
-      int chartHeight = int(scalingFactor * p);
-      chartHeight = min(RESOLUTION_Y, chartHeight);
-      chartHeight = max(1, chartHeight); // in case power is zero
-
-      // deal with the ftp power bar display on the far right
-      imgSprite.fillRect(RESOLUTION_X - 20, 0, 20, RESOLUTION_Y, TFT_BLACK);
-      imgSprite.fillRect(RESOLUTION_X - 20, RESOLUTION_Y - chartHeight, 20, chartHeight, zChartColor);
-
+      imgSprite.drawString(getPowerInSelectedUnits(p), RESOLUTION_X/2  + 16 ,14, 7);
+      imgSprite.drawString(unitPrefix + getWattsOrWKGLabel() ,RESOLUTION_X/2 + 24 , 64, 4); 
       
 
-      //imgSprite.drawString(powerZone, RESOLUTION_X - 20, RESOLUTION_Y - 20, 2);
-      imgSprite.drawString(powerZone + " " + powerDesc, RESOLUTION_X/2, RESOLUTION_Y-20, 2);
-      // Button Toggle
-      char buffer[7];
-      if (intWattsOrWKG == 0) {
-        //Watts mode
-        dtostrf(p, 5,0,buffer);
-        //Serial.println("Buffer:" + String(buffer) + ":");
-        imgSprite.drawString(String(buffer), RESOLUTION_X/2 - 10,70, 7);
-        imgSprite.drawString(unitPrefix + "Watts",RESOLUTION_X/2, 120, 4); 
+      // MAX and AVG Power
+      setTextColorBasedOnFTPPct(100 * maxPowerArray[powerAvgMode]/inputFTP);
+      imgSprite.drawString("Max:" + getPowerInSelectedUnits(maxPowerArray[powerAvgMode]) , RESOLUTION_X/2  + 24, 100, 4);
+
+      //
+
+      setTextColorBasedOnFTPPct(100 * avgDurationPower()/inputFTP);
+      imgSprite.drawString("Avg:" + getPowerInSelectedUnits(avgDurationPower()), RESOLUTION_X/2  + 24, 124, 4);
+
+      setDefaultTextColor();
+      //imgSprite.drawString("Weight: " + String(inputWeightKGs) + "  FTP: " + String(inputFTP), 5, 130, 2);
+      long secsSinceStart = long(millis()/1000);
+      
+      imgSprite.drawString("Elapsed: " + secondsToFormattedTime(secsSinceStart) , RESOLUTION_X/2  + 24, RESOLUTION_Y - 15, 2); // but the time since boot in lower left corner in tiny type
+
+
+
+
+
+      drawPowerChart(ftpPct);
+  setDefaultTextColor();
+}
+/*---------------------------------------------------------------------------------------------*/
+
+String getDurationMode(){
+       if (powerAvgMode == avg3Secs) {
+        return ("3s");
+      } else if (powerAvgMode == avg10Secs) {
+        return ("10s");
+      } else {
+        // instant power
+        return ("Inst.");
       }
-      else
-      {
-        // W/KG mode
-        float flPowerToWeight = p/float(inputWeightKGs);
-        //Serial.println("W/KG" + String(flPowerToWeight));
-        dtostrf(flPowerToWeight, 5,2,buffer);
-        //Serial.println("Buffer:" + String(buffer) + ":");
-        imgSprite.drawString(String(buffer), RESOLUTION_X/2 - 10,70, 7);
-        imgSprite.drawString(unitPrefix + "W/KG",RESOLUTION_X/2, 120, 4);
-      }
+}
+/*---------------------------------------------------------------------------------------------*/
+String getPowerInSelectedUnits(int p) {
+  //expects p to be power, returns formatted power either in watts or w/kg based on the 
+  // user toggled selection from the lower button
+  char buffer[7];
+  float ratio;
+  if (intWattsOrWKgOrFTP == powerWatts) {
+    //Watts mode
+    dtostrf(p, 5,0,buffer);
+  } else if (intWattsOrWKgOrFTP == powerWKG) {
+    // W/KG mode
+    ratio = p/float(inputWeightKGs);
+    dtostrf(ratio, 5,2,buffer);
+  } else {
+    //FTP mode
+    ratio = 100 * p/float(inputFTP);
+    dtostrf(ratio, 5,0,buffer);
+
+  }
+  return String(buffer);
+}
+/*---------------------------------------------------------------------------------------------*/
+String getWattsOrWKGLabel(){
+  if (intWattsOrWKgOrFTP == powerWatts) {
+    return "Watts";
+  } else if (intWattsOrWKgOrFTP == powerWKG) {
+    return "W/KG";
+  } else {
+    // FTP mode
+    return "% FTP";
+  }
+}
+/*---------------------------------------------------------------------------------------------*/
+void drawPowerChart(int ftpPct) {
+  // 1/5/2024 - moved to center of display
+  //Serial.println("drawPowerChart, ftpPct:" + String(ftpPct));
+  // expects power as integer pct of FTP
+  uint32_t zChartColor = getColorBasedOnFTPPct(ftpPct);
+  int h = getChartHeightBasedOnFTP(ftpPct);
+  // deal with the ftp power bar display on the far right
+  imgSprite.fillRect(RESOLUTION_X/2 - 10, 0, 20, RESOLUTION_Y, TFT_BLACK);
+  imgSprite.fillRect(RESOLUTION_X/2 - 10, RESOLUTION_Y - h, 20, h, zChartColor);
+
+  // draw indicators for the power thresholds, we don't need the 0th threshold
+  for (int i = 1; i < numPowerZones; i++) setPowerZoneIndicator(powerZoneThreshold[i]);
+
+  // now set a triangle markers for max power and average power
+  // convert max power (in watts) to ftp pct to be compatible with the chart
+  // max triangle is point down
+  int topY = max(RESOLUTION_Y - getChartHeightBasedOnFTP(int((100 * maxPowerArray[powerAvgMode])/inputFTP)),0);
+  int bottomY = min(topY + 10, RESOLUTION_Y);
+  imgSprite.fillTriangle(RESOLUTION_X/2 - 8, topY, RESOLUTION_X/2 + 8, topY, RESOLUTION_X/2, bottomY, getColorBasedOnFTPPct(int((100 * maxPowerArray[powerAvgMode])/inputFTP)));
+
+  if (powerObservationsArray[powerAvgMode] > 0){
+    // avg power (in motion) is powerCumulativeTotalArray[powerAvgMode]/powerObservationsArray[powerAvgMode] - convert to FTP to work with the chart
+    // average triangle is point up
+    topY = max(RESOLUTION_Y - getChartHeightBasedOnFTP(int(100 * avgDurationPower()/inputFTP)), 0);
+    bottomY = min(topY + 10, RESOLUTION_Y);
+    if (avgDurationPower() > currentPower) {
+      imgSprite.fillTriangle(RESOLUTION_X/2 - 8, bottomY, RESOLUTION_X/2 + 8, bottomY, RESOLUTION_X/2, topY, 
+        getColorBasedOnFTPPct(int(100 * avgDurationPower()/inputFTP)));
+    } else {
+      // currentPower is greater than average power, which means the average marker will be superimposed on the power bar - so make it black to standout
+      imgSprite.fillTriangle(RESOLUTION_X/2 - 8, bottomY, RESOLUTION_X/2 + 8, bottomY, RESOLUTION_X/2, topY, TFT_BLACK);
+    }
+  }
+  
+}
+/*---------------------------------------------------------------------------------------------*/
+void setPowerZoneIndicator(int ftpPct) {
+  //Serial.println("setPowerZoneIndicator, ftpPct:" + String(ftpPct));
+  // draw a pair of marking indicators, 4 pixels long on the left and right side of the power chart
+  // 1/5/2024 - moved to center of dingus, with the power chart centered on resolution_x/2 +- 10 pixels
+  int y = RESOLUTION_Y - getChartHeightBasedOnFTP(ftpPct);
+  imgSprite.drawLine(RESOLUTION_X/2 - 10, y, RESOLUTION_X/2 - 7, y, getColorBasedOnFTPPct(ftpPct));
+  imgSprite.drawLine(RESOLUTION_X/2 + 7, y, RESOLUTION_X/2 + 10, y, getColorBasedOnFTPPct(ftpPct));
+}
+/*---------------------------------------------------------------------------------------------*/
+int getChartHeightBasedOnFTP(int ftpPct){
+   //chart will cap out at the max threshold, plus 10
+
+  // start with 100% FTP scaling, but bump that if maxpower exceeds
+
+  float chartMaxFTP = max(float(100.0), float(100 * maxPowerArray[powerAvgMode]/inputFTP));
+  float scalingFactor = float(RESOLUTION_Y) / chartMaxFTP;
+  int h = int(scalingFactor * ftpPct);
+  //Serial.println("getChartHeightBasedOnFTP, ftpPct:" + String(ftpPct) + " h:" + String(h));
+  h = min(RESOLUTION_Y, h);  // in case we calc a height greater than the resolution
+  h = max(1, h); // in case power is zero
+  return h;
+}
+/*---------------------------------------------------------------------------------------------*/
+void setTextColorBasedOnFTPPct(int ftpPct){
+  //Serial.println("setTextColorBasedOnFTPPct, ftpPct:" + String(ftpPct));
+  imgSprite.setTextColor(getColorBasedOnFTPPct(ftpPct), TFT_BLACK);
+}
+/*---------------------------------------------------------------------------------------------*/
+void setDefaultTextColor() {
   imgSprite.setTextColor(TFT_SKYBLUE, TFT_BLACK);
 }
 /*---------------------------------------------------------------------------------------------*/
+uint32_t getColorBasedOnFTPPct(int ftpPct) {
+  //Serial.println("getColorBasedOnFTPPct, ftpPct:" + String(ftpPct));
+  for (int i = numPowerZones - 1; i >= 0; i--) {
+    if (ftpPct > powerZoneThreshold[i]) {
+      //Serial.println("getColorBasedOnFTPPct return:" + String(powerZoneThreshold[i]));
+      return powerZoneColor[i];
+    }
+  }
+  return TFT_DARKGREY;
+}
+/*---------------------------------------------------------------------------------------------*/
+
+String getPowerZoneDesc(int ftpPct) {
+  //Serial.println("getPowerZoneDesc, ftpPct:" + String(ftpPct));
+  for (int i = numPowerZones - 1; i >= 0; i--) {
+    if (ftpPct > powerZoneThreshold[i]) {
+      //Serial.println("getPowerZoneDesc return:" + powerZoneDescription[i]);
+      return powerZoneDescription[i];
+    }
+  }
+  return "Coasting / Stopped";
+}
+
+/*---------------------------------------------------------------------------------------------*/
 // roll second averages down, bumping off the older and adding the newest average second observation
 void updateAvgPowerArray(float newestAvgSec) {
-  for (int i = maxSecsToAvg - 1; i--; i > 0){
+
+  if (newestAvgSec > 0){
+    powerObservationsArray[avgInstant]++;
+    powerCumulativeTotalArray[avgInstant] += newestAvgSec;
+  }
+  for (int i = maxSecsToAvg - 1; i> 0; i--){
         avgBySecond[i] = avgBySecond[i - 1];
       }
     avgBySecond[0] = newestAvgSec;
+  // update the 3 second max, but only if all of the seconds spanned are non-zero
+  int n =0;
+  int p = 0;
+  for (int i = 0; i < 3; i++) {
+    if (avgBySecond[i] > 0) n++;
+    p = p + avgBySecond[i];
+  }
+  if (n == 3 ) {
+    if (int(p/3) > maxPowerArray[avg3Secs]) maxPowerArray[avg3Secs] = int(p/3);
+    powerObservationsArray[avg3Secs]++;
+    powerCumulativeTotalArray[avg3Secs] += int(p/3);
+  }
+  // ditto the 10 second max
+  p = 0;
+  n = 0;
+  for (int i = 0; i < 10; i++) {
+    if (avgBySecond[i] > 0) n++;
+    p = p + avgBySecond[i];
+  }
+  if (n == 10) {
+    if (int(p/10) > maxPowerArray[avg10Secs]) maxPowerArray[avg10Secs] = int(p/10);
+    powerObservationsArray[avg10Secs]++;
+    powerCumulativeTotalArray[avg10Secs] += int(p/10);
+  }
+
 }
 /*------------------------------------------------------------------------------------------------------------*/
 void calcTileAndLock(uint8_t *pData, size_t length){
   /*for (int i = 0; i < length; i++) {
-    Serial.print(pData[i], HEX);
-    Serial.print(" "); //separate values with a space
+    //Serial.print(pData[i], HEX);
+    //Serial.print(" "); //separate values with a space
   }
-  Serial.println("");
+  //Serial.println("");
   */
     //lock, unlock update
   if(length == 3 && pData[0] == 0xfd && pData[1] == 0x33) {
@@ -797,29 +1030,27 @@ void calcTileAndLock(uint8_t *pData, size_t length){
 ------------------------------------------------------------------------------------------------------------*/
 static void notifyCallbackPower(BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify)
 {
-  uint16_t tmp16 = (pData[3] << 8 | pData[2]);
-  currentPower = (float)(tmp16);
+  currentPower = (int)(pData[3] << 8 | pData[2]);
   long currentSecond = long(millis()/1000);
-  if (currentPower > maxPower) maxPower = currentPower;
+  if (currentPower > maxPowerArray[avgInstant]) maxPowerArray[avgInstant] = currentPower;
 
   if (currentPower > 0) {
+    lastNonZeroPower = currentSecond;
     // are we still tracking within the "current" second - if so update intra second #s
     if (lastPowerObservationSecond == currentSecond ) {
       intraSecondObservations++;
-      intraSecondCumulativeTotal += long(tmp16);
+      intraSecondCumulativeTotal += long(currentPower);
     } else {
       // we have moved onto a new second - bump the second track of power observations, including our structure for calculating moving avg
-
-      powerObservations++;
+      
       if (intraSecondObservations > 0) {
-        powerCumulativeTotal += float(intraSecondCumulativeTotal/intraSecondObservations);
         updateAvgPowerArray(intraSecondCumulativeTotal/intraSecondObservations);
       } else {
         updateAvgPowerArray(0);
       }
       // reset intra second varaibles
       intraSecondObservations = 1;
-      intraSecondCumulativeTotal = long(tmp16);
+      intraSecondCumulativeTotal = currentPower;
       lastPowerObservationSecond = currentSecond;
     }
   }
