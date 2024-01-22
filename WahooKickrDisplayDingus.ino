@@ -1,6 +1,4 @@
-# define cVERSION "20240107"
-# define demoMode false // true or false, if true put dingus in a demo loop, and will not care if kickr is available
-
+# define cVERSION "20240120"
 // Check and set the default values for rider Weight in Kilograms, FTP in watts - enter FTP in increments of 5!
 // These defaults can be changed and saved directly thru the Dingus interface
 // by pressing both buttons at once and following the prompts.   Those changes
@@ -76,8 +74,31 @@ Change Log:
 01/07/2024 - extended logic to keep track of max and avg for instant, 3 second and 10 second.  Reorganized screen layout to put the
              power chart in the center, gear graphic in the lower left, grade in the upper left and power plus avg/max as the entire
              right side.
+20240107 build to github
+01/08/2024 - added logic such that if no connection to kickr is made within 20 seconds, dingus automatically reboots to try again
+01/09/2024 - added a power distribution chart to the coasting screen
+01/11/2024 - changed power display to alternate every 3 seconds between max/avg power and a power distribution chart in the lower right.
+01/12/2024 - added the ability to toggle the dingus into demo mode without having to recompile / flash the dingus - see notes on the
+            demoMode boolean.  Also added elapsed time to the coasting screen, just above pedaling time
+01/15/2024 - added cadence support, thanks to Nikolaus Kirchseige for decoding how to pull that info out of the power callback.   Added
+             crank animation using a second embedded sprite plus rotation.
+01/16/2024 - added code to determine if settings have been written to EEPROM.  If not, then just use default settings until 
+            settings have been saved to eeprom.  Note that reflashing the board erases settings.   Also modified the logic
+            around button checks, after realizing that the button checks were expensive enough to screw up animation
+01/19/2024 - logic that displays summary / coasting screen switched from triggering on 3 seconds of 0 power to cadence = 0
+            note that cadence typically takes 3 seconds to go to 0, even with no pedaling, due to the need to average cadence over 
+            a period to get anything usable (Zwift/Rouvy do this too)
+01/20/2024 - revamped button debounce logic to avoid jumping thru two or more states when changing power model or time avg interval.
+            chained chain path graphic to use arcs rather than coloring the entire front and rear ring.  Tinkered with the crank
+            revolution logic to average across the last 12 observations (typically 1 to 3 seconds)
+
 
 **********************************************************************************************************/
+// set demoMode to true to make the dingus run in demo mode.  However, you can also put the dingus into demo mode
+// by holding both buttons once the device powers up and before it connects to the kickr.   So,  if your kickr is not in range
+// or powered off, you can just power up your dingus and hold both buttons to enter demo mode without having to recompile
+// and push this program with the flag set to true
+boolean demoMode = false; // true or false, if true put dingus in a demo loop, and will not care if kickr is available
 
 #include "BLEDevice.h"
 #include <TFT_eSPI.h> // Graphics and font library for ST7735 driver chip
@@ -86,7 +107,8 @@ Change Log:
 #define EEPROM_SIZE 6 // 1 byte for power mode (watts or w/kg), 1 byte for avg mode (instant, 3s, 10s), 2 bytes each for weight and ftp
 TFT_eSPI tft = TFT_eSPI();  // Invoke library, pins defined in User_Setup.h
 // define a sprite to cover the whole screen, avoids flickr - s
-TFT_eSprite imgSprite = TFT_eSprite(&tft);
+TFT_eSprite imgMainSprite = TFT_eSprite(&tft);
+TFT_eSprite imgCrankInset = TFT_eSprite(&tft);
 
 // BUTTONs
 #define BOTTOM_BUTTON_PIN 0
@@ -100,9 +122,9 @@ static BLEUUID charGearingUUID("a026e03a-0a7d-4ab3-97fa-f1500f9feb8b");
 //for currentGrade
 static BLEUUID serviceGradeUUID("a026ee0b-0a7d-4ab3-97fa-f1500f9feb8b");
 static BLEUUID charGradeUUID("a026e037-0a7d-4ab3-97fa-f1500f9feb8b");
-// Power Measurement
+// Power and Cadence Measurement
 static BLEUUID servicePowerUUID("00001818-0000-1000-8000-00805f9b34fb");
-static BLEUUID charPowerUUID("00002a63-0000-1000-8000-00805f9b34fb");
+static BLEUUID charPowerAndCadenceUUID("00002a63-0000-1000-8000-00805f9b34fb");
 /* --------------------------------------------------------------------------*/
 static boolean doConnect = false;
 static boolean connected = false;
@@ -118,31 +140,60 @@ int currentCassette = 1;
 int numFrontGears = 1;
 int numRearGears = 1;
 
+// 1/15/2024 - moved gear graphic define here so second sprite count access
+#define rearGearX 23 // was 28
+#define rearGearY 118 // was 42
+#define rearMinSize 6 // radius of smallest ring
+#define rearGearSpacing 1
+#define frontGearX 110
+#define frontGearY 128 // was 50
+#define frontMinSize  20  // radius of smaller ring
+#define frontGearSpacing 10  // gap to next larger ring
+#define jockeyWheelSize 4
+int crankInsetSize = 2 * (frontMinSize + frontGearSpacing); // assuming two ring crankset, should by dynamic
+#define crankExtensionBeyondRing 10
+int crankAngle = 0;
+
 uint8_t arr[32];
 int tilt_lock = 0;
+//---------------------------------------
 #define powerWatts 0
 #define powerWKG 1
 #define powerFTP 2
-int intWattsOrWKgOrFTP = powerWatts; // 0 = watts, 1 = W/KG, 2 = FTP
+int intWattsOrWKgOrFTP = powerWatts; 
+//---------------------------------------
 #define avgInstant 0
 #define avg3Secs 1
 #define avg10Secs 2
-int  powerAvgMode = avg3Secs; // 0 = instant 1 = 3s, 2 = 10s
+int  powerAvgMode = avg3Secs;
+//---------------------------------------
 int maxPowerArray[3]; // keep track of max power for instant, 3s and 10s
 long powerObservationsArray[3];
 float powerCumulativeTotalArray[3];
-
+//---------------------------------------
 long lastPowerObservationSecond = 0;
 long lastNonZeroPower = 0;
 long intraSecondObservations = 0;
 long intraSecondCumulativeTotal = 0;
 #define maxSecsToAvg 12
-float avgBySecond[maxSecsToAvg];
+float avgPowerBySecond[maxSecsToAvg];
 
+//---------------------------------------
+// Crank Revolutions
+float NewCrankRevolutions;
+float OldCrankRevolutions;
+long lastCrankUpdateMillis;
+long lastCadenceReadSecs = 0;
+#define maxNumCrankObservations 12
+long crankRevolutionObservations[maxNumCrankObservations];
+long crankRevolutionObservationTimestamps[maxNumCrankObservations];
+
+//---------------------------------------
 #define inputNormalMode 0
 #define inputWeightMode 1
 #define inputFTPMode 2
 int inputMode = 0; // 0 for normal mode, 1 for weight input, 2 for ftp input
+//---------------------------------------
 int inputWeightKGs = defaultWEIGHT;
 int inputFTP = defaultFTP;
 #define minWeight 25
@@ -157,6 +208,7 @@ int inputFTP = defaultFTP;
 int powerZoneThreshold[numPowerZones] = {0, 59, 75, 89, 104, 118};
 String powerZoneDescription[numPowerZones] = {"Z1 Active Recovery", "Z2 Endurance", "Z3 Tempo", "Z4 Lactate Threshold", "Z5 VO2 Max", "Z6 Anaerobic "};
 uint32_t powerZoneColor[numPowerZones] = {TFT_LIGHTGREY,TFT_BLUE,TFT_GREEN,TFT_YELLOW,TFT_ORANGE,TFT_RED};
+long secsInPowerZone[numPowerZones] = {0,0,0,0,0,0}; // used to track amount of time in each power zone
 
 // if you want to use Rouvy zones, uncomment the following, and comment out the zwift definitions above
 // power zones based on Rouvy - see https://support.rouvy.com/hc/en-us/articles/360018830597-Power-Zones
@@ -164,8 +216,10 @@ uint32_t powerZoneColor[numPowerZones] = {TFT_LIGHTGREY,TFT_BLUE,TFT_GREEN,TFT_Y
 //int powerZoneThreshold[numPowerZones] = {0, 55, 75, 90, 105, 120, 150};
 //String powerZoneDescription[numPowerZones] = {"Z1 Active Recovery", "Z2 Endurance", "Z3 Tempo", "Z4 Lactate Threshold", "Z5 VO2 Max", "Z6 Anaerobic ", "Z7 Neuromuscular"};
 //uint32_t powerZoneColor[numPowerZones] = {TFT_PURPLE,TFT_BLUE,TFT_CYAN,TFT_GREEN,TFT_GREENYELLOW,TFT_ORANGE,TFT_RED};
-
-
+//long secsInPowerZone[numPowerZones] = {0,0,0,0,0,0,0}; // used to track amount of time in each power zone
+//---------------------------------------
+// used to keep track of the last toggle between max/avg power and power dist chart - see updatePower()
+//long lastPowerToggleSecond = 0; // used to keep track of the last toggle between max/avg power and power dist chart
 /***************************************************************************************************************************
 
   Callback and Bluetooth Stuff
@@ -257,8 +311,8 @@ bool connectToServer() {
          pRemoteCharacteristic2->registerForNotify(notifyCallbackGrade);       
     }
     /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
-    // Power
-    // Obtain a reference to the power servicein the remote BLE server.
+    // Power and Cadence
+    // Obtain a reference to the power and cadence service in the remote BLE server.
     pRemoteService = pClient->getService(servicePowerUUID);
     if (pRemoteService == nullptr) {
       Serial.print("Failed to find our Power UUID: ");
@@ -266,25 +320,23 @@ bool connectToServer() {
       pClient->disconnect();
       return false;
     }
-    Serial.println(" - Found our Power service");
+    Serial.println(" - Found our Power and Cadence service");
     // Obtain a reference to the characteristic in the service of the remote BLE server.
-    pRemoteCharacteristic3 = pRemoteService->getCharacteristic(charPowerUUID);
+    pRemoteCharacteristic3 = pRemoteService->getCharacteristic(charPowerAndCadenceUUID);
     if (pRemoteCharacteristic3 == nullptr) {
-      Serial.print("Failed to find our Power characteristic UUID: ");
-      Serial.println(charPowerUUID.toString().c_str());
+      Serial.print("Failed to find our Power and Cadence characteristic UUID: ");
+      Serial.println(charPowerAndCadenceUUID.toString().c_str());
       pClient->disconnect();
       return false;
     }
-    Serial.println(" - Found our Power characteristic");
+    Serial.println(" - Found our Power and Cadence characteristic");
     // Read the value of the characteristic.
-    if(pRemoteCharacteristic2->canRead()) {
-      std::string value = pRemoteCharacteristic2->readValue();
+    if(pRemoteCharacteristic3->canRead()) {
+      std::string value = pRemoteCharacteristic3->readValue();
       std::copy(value.begin(), value.end(), std::begin(arr));
-      Serial.print("currentGrade or lock first read : ");
-      calcTileAndLock(arr, value.size());
     }
     if(pRemoteCharacteristic3->canNotify()) {
-         pRemoteCharacteristic3->registerForNotify(notifyCallbackPower);       
+         pRemoteCharacteristic3->registerForNotify(notifyCallbackPowerAndCadence);       
     }
     /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -*/
     connected = true;
@@ -323,7 +375,7 @@ void setup() {
 
     // init tracking structure for avg power
   for (int i = 0; i < maxSecsToAvg; i++){
-    avgBySecond[i] = 0;
+    avgPowerBySecond[i] = 0;
   }
   // init max power array
   for (int i = 0; i < 3; i++) maxPowerArray[i] = 0;
@@ -337,8 +389,7 @@ void setup() {
   tft.setTextColor(TFT_SKYBLUE, TFT_BLACK);
   tft.drawString("Wahoo Kickr Display Dingus", 0, 0, 4);
   tft.drawString("Weight: " + String(inputWeightKGs) + " KGs    FTP: " + String(inputFTP) + " watts", 0,40, 2);
-  tft.drawString("If no connection after 20 seconds,", 0,60,2);
-  tft.drawString("try resetting your dingus", 0,80,2);
+
   tft.drawString("Connecting....", 0, 100, 4);
   tft.drawString("Jay Wheeler v" + String(cVERSION), 0, RESOLUTION_Y - 16, 2);
   
@@ -353,53 +404,29 @@ void setup() {
   pBLEScan->setActiveScan(true);
   pBLEScan->start(5, false);
 
-  imgSprite.createSprite(RESOLUTION_X, RESOLUTION_Y);  // will be used for screen updates, prevents flicker
+
+  //tft.setPivot(frontGearX, frontGearY); // center point for crank rotation graphic
+  imgMainSprite.createSprite(RESOLUTION_X, RESOLUTION_Y);  // will be used for screen updates, prevents flicker
+  imgMainSprite.setPivot(frontGearX, frontGearY); // center point for crank rotation graphic
+  // used to create a rotation effect in the crank graphic - make the sprite a bit bigger than the crank inset
+  // size, as we want the crank arm to extend past the larger chain right
+
+  imgCrankInset.createSprite (crankInsetSize + (crankExtensionBeyondRing * 2),crankInsetSize + (crankExtensionBeyondRing *2));
 } // End of setup.
 
 
 /*========================================================================================================================*/
 void loop() {
-  
  
   // test graphics - change condition to 1 == 1 in the following and run the sketch with your kickr bike off to exercise the graphics
   // essentially a demo mode
+  
 
+  if (!connected && digitalRead(BOTTOM_BUTTON_PIN) == LOW && digitalRead(TOP_BUTTON_PIN) == LOW ) {
+    demoMode = true;
+  }
   if (demoMode) {
-    Serial.println("Top of demo loop");
-    numFrontGears = 2;
-    numRearGears = 11;
-
-    
-    //currentPower = 50;
-    for (int fg = 1; fg < 3; fg++) {
-      for (int rg = 1; rg < 12; rg++) {
-        currentChainRing = fg;
-        currentCassette = rg;
-        numFrontGears = 2;
-        numRearGears = 11;
-        if (rg % 2 == 0) {
-          currentPower += 30;
-        } else {
-          currentPower -= 15;
-        }
-        if (currentPower > int(1.6 * inputFTP)) currentPower = 50;
-        maxPowerArray[avgInstant] = max(int(maxPowerArray[avgInstant]),int(currentPower));
-        maxPowerArray[avg3Secs] = int(maxPowerArray[avgInstant] * 0.9);
-        maxPowerArray[avg10Secs] = int(maxPowerArray[avgInstant] * 0.82);
-        powerCumulativeTotalArray[avgInstant]= 1000;
-        powerObservationsArray[avgInstant] = 7;
-        powerCumulativeTotalArray[avg3Secs]= 900;
-        powerObservationsArray[avg3Secs] = 7;
-        powerCumulativeTotalArray[avg10Secs]= 850;
-        powerObservationsArray[avg10Secs] = 7;
-        for (int i = 0; i < 10; i++) avgBySecond[i] = currentPower + 2;
-        currentGrade = rg; // why not?
-        checkButtons();
-        updateDisplayViaSprite();
-        delay (500);
-      }
-    }
-    // end demo loop
+    runDemo(); // will eventually return after running thru a full cycle of gear changes and a coasting screen
   } else {
   // NORMAL OPERATION, needs to connect to a kickr bike to do anything
   
@@ -428,30 +455,133 @@ void loop() {
     // If we are connected to a peer BLE Server, update the characteristic each time we are reached
     // with the current time since boot.
     if (connected) {
-        String newValue = "Time since boot: " + String(millis()/1000);
+        //String newValue = "Time since boot: " + String(millis()/1000);
       // Set the characteristic's value to be the array of bytes that is actually a string.
-      pRemoteCharacteristic->writeValue(newValue.c_str(), newValue.length());
+      //pRemoteCharacteristic->writeValue(newValue.c_str(), newValue.length());
+      static int cb = 1;
+
+      if (inputMode == inputNormalMode) {
+        // if we are in normal mode, we don't want to constantly check the buttons, 
+        // apparently that is expensive time wise, and really screws up the animation
+        // of the crank rotation - check once a second
+        cb++;
+        if (cb == 15) {
+          // we don't want to continually check buttons, this will check ~ twice / sec
+          checkButtons();
+          cb = 1;
+        }
+      } else {
+        // we are in one of the input modes, check the buttons constantly
+        checkButtons();
+      }
+      //checkButtons(); // we only want to check the buttons once we are in the normal loop
       updateDisplayViaSprite();
+      
 
     }else if(doScan){
+      
+      
       BLEDevice::getScan()->start(0);  // this is just eample to start scan after disconnect, most likely there is better way to do it in arduino
+    } else {
+      // have we been trying for more than 20 seconds?  If so, reboot the dingus to try again
+      if (long(millis()/1000 > 20)) {
+        tft.fillScreen(TFT_BLACK);
+        tft.drawString("Unable to connect.", 0, 0, 4);
+        tft.drawString("Restarting your dingus.", 0, 50, 4);
+        delay(2000);
+        ESP.restart();
+      }
     }
-    checkButtons();
-    delay(100); // Delay a 1/10 second
+    
+    delay(33); // Delay ~1/30 second, yields 30 frames/second for smooth animation
   } // normal loop
 } // End of loop
 /*========================================================================================================================*/
+void runDemo() {
+  // 1/19/2024 - moved the demo logic out of the main loop here
+      Serial.println("Top of demo loop");
+
+
+    numFrontGears = 2;
+    numRearGears = 11;
+    secsInPowerZone[0] =  100;
+    secsInPowerZone[1] =  180;
+    secsInPowerZone[2] =  80;
+    secsInPowerZone[3] =  50;
+    secsInPowerZone[4] =  30;
+    secsInPowerZone[5] =  10;
+    
+    currentPower = 50;
+    // make up some data for the cadence arrays - below should yield avg cadence of 60
+    int n = 100;
+    for (int i = 0; i < maxNumCrankObservations; i++) {
+      crankRevolutionObservations[i]  = n;
+      crankRevolutionObservationTimestamps[i] = n * 1000;
+      n--;
+    }
+
+  
+
+    for (int fg = 1; fg < 3; fg++) {
+      for (int rg = 1; rg < 12; rg++) {
+        //currentCadence++;
+        currentChainRing = fg;
+        currentCassette = rg;
+        numFrontGears = 2;
+        numRearGears = 11;
+        if (rg % 2 == 0) {
+          currentPower += 30;
+        } else {
+          currentPower -= 15;
+        }
+        if (currentPower > int(1.6 * inputFTP)) currentPower = 50;
+        maxPowerArray[avgInstant] = max(int(maxPowerArray[avgInstant]),int(currentPower));
+        maxPowerArray[avg3Secs] = int(maxPowerArray[avgInstant] * 0.9);
+        maxPowerArray[avg10Secs] = int(maxPowerArray[avgInstant] * 0.82);
+        powerCumulativeTotalArray[avgInstant]= 1000;
+        powerObservationsArray[avgInstant] = 7;
+        powerCumulativeTotalArray[avg3Secs]= 900;
+        powerObservationsArray[avg3Secs] = 7;
+        powerCumulativeTotalArray[avg10Secs]= 850;
+        powerObservationsArray[avg10Secs] = 7;
+        for (int i = 0; i < 10; i++) avgPowerBySecond[i] = currentPower + 2;
+        currentGrade = rg; // why not?
+        checkButtons();
+        // stay in the the current gear for 2 seconds, but refresh the display during that time to
+        // check crank animation
+        for (int n = 0; n < 100; n++) {
+          updateDisplayViaSprite();
+          delay (10);
+        }
+      }
+    }
+    // show the coasting screen for 10 seconds
+    
+    imgMainSprite.fillRect(0 ,0 , RESOLUTION_X , RESOLUTION_Y , TFT_BLACK);
+    updateCoastingStats();
+    imgMainSprite.pushSprite(0,0);  // update the physical screen
+
+    delay(10000);
+    // end demo loop
+}
 void restoreEEPROMSettings(){
-  // these two are safe to read even on a virgin board, as 0 is a valid state
-  powerAvgMode = EEPROM.read(0);
-  intWattsOrWKgOrFTP = EEPROM.read(1);
-  // weight and ftp can be in the range 25 to 500, which is too big for one byte, so...
-  inputWeightKGs = EEPROM.read(2);
-  if (inputWeightKGs < minWeight ) inputWeightKGs = defaultWEIGHT;
-  if (inputWeightKGs > maxWeight ) inputWeightKGs = defaultWEIGHT;
-  inputFTP = EEPROM.read(3) * 5;
-  if (inputFTP < minFTP) inputFTP = defaultFTP;
-  if (inputFTP > maxFTP) inputFTP = defaultFTP;
+  // 1/16/2024 - added check for a magic number in slot 4, to reduce the risk of getting a garbage number back that pases
+  //          checks - if the magic number is found, use default settings
+  if (int(EEPROM.read(4)) != 42) {
+    inputWeightKGs = defaultWEIGHT;
+    inputFTP = defaultFTP;
+  } else {
+    // looks we have valid saved settings
+    powerAvgMode = EEPROM.read(0);
+    intWattsOrWKgOrFTP = EEPROM.read(1);
+    // weight and ftp can be in the range 25 to 500, which is too big for one byte, so...
+    inputWeightKGs = EEPROM.read(2);
+    if (inputWeightKGs < minWeight ) inputWeightKGs = defaultWEIGHT;
+    if (inputWeightKGs > maxWeight ) inputWeightKGs = defaultWEIGHT;
+    inputFTP = EEPROM.read(3) * 5;
+    if (inputFTP < minFTP) inputFTP = defaultFTP;
+    if (inputFTP > maxFTP) inputFTP = defaultFTP;
+  }
 }
 /*-------------------------------------------------------------------------------------------------------------------*/
 void saveEEPROMSettings(){
@@ -462,46 +592,68 @@ void saveEEPROMSettings(){
   int oldinputFTP = EEPROM.read(3) * 5;
 
   if (oldpowerAvgMode != powerAvgMode || oldintWattsOrWKgOrFTP != intWattsOrWKgOrFTP
-      || oldinputWeightKGs != inputWeightKGs || oldinputFTP != inputFTP) {
-        EEPROM.write(0,powerAvgMode);
-        EEPROM.write(1,intWattsOrWKgOrFTP);
-        EEPROM.write(2,inputWeightKGs);
-        // FTP must in be increments of 5
-        // which allows dividing by 5, which will fit any reasonable
-        // FTP value into a byte - these locations are only 8 bits
-        EEPROM.write(3,int(inputFTP/5));
-        EEPROM.commit();
-      }
+  || oldinputWeightKGs != inputWeightKGs || oldinputFTP != inputFTP) {
+    EEPROM.write(0,powerAvgMode);
+    EEPROM.write(1,intWattsOrWKgOrFTP);
+    EEPROM.write(2,inputWeightKGs);
+    // FTP must in be increments of 5
+    // which allows dividing by 5, which will fit any reasonable
+    // FTP value into a byte - these locations are only 8 bits
+    EEPROM.write(3,int(inputFTP/5));
+    // 1/16/2024 - added write of magic number of slot 4 to use as a check when reading back settings
+    EEPROM.write(4, int(42));
+
+    EEPROM.commit();
+    imgMainSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_DARKGREEN);
+    imgMainSprite.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+    imgMainSprite.drawString("Settings saved", 10, 10, 4);
+    imgMainSprite.pushSprite(0,0);  // update the physical screen
+    delay(2000);
+    setDefaultTextColor();
+  } else {
+    imgMainSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_DARKGREEN);
+    imgMainSprite.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+    imgMainSprite.drawString("Settings unchanged", 10, 10, 4);
+    imgMainSprite.pushSprite(0,0);  // update the physical screen
+    delay(2000);
+    setDefaultTextColor();
+  }
 }
 /*-------------------------------------------------------------------------------------------------------------------*/
 void updateDisplayViaSprite(){
   // the subroutines below update a screen sized "sprite" - the actual update to the physical screen
   // happens in one step at the end of this routine - this gets rid of flicker
+  long currentMillis = long(millis());
+  long currentSecond = long(currentMillis/1000);
 
-  long currentSecond = long(millis()/1000);
-
-  //  NORMAL MODE - not updating ftp or weight
-
+  
+  // have we moved into a new second?  If so update power array.  I put the code to trap that 
+  // here, as we can't count on the power callback getting called if we are coasting
   if (currentPower == 0 && currentSecond != lastPowerObservationSecond) {
     updateAvgPowerArray(0);
     lastPowerObservationSecond = currentSecond;
   }
   // note that the dingus can be in one of three modes - the normal mode, or when both buttons are pressed together
-  // the mode to input weight followed by the mode to input FTP
+  // the mode to input weight followed by the mode to input FTPcrankAngle
+  //  NORMAL MODE - not updating ftp or weight
   if (inputMode == inputNormalMode) {
     
     setDefaultTextColor();
-    imgSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_BLACK);
-    if (currentSecond > lastNonZeroPower + 3 and ! demoMode) {
-      // it has been at least 3 sconds since the last non-zero power, so show the summary screen
-      
+    imgMainSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_BLACK);
+    // 1/19/2024 - after adding cadence support, switch test from 0 power to cadence = 0
+    // this way, if you are spinning away going downhill but producing no power, you will see
+    // see your cadence
+    //if (currentSecond > lastNonZeroPower + 3 and ! demoMode) {
+    if (getCurrentCadence() == 0 and ! demoMode) {
+      // it has been at least 3 sconds since the last non-zero cadence, so show the summary screen
+      // don't jump to coasting display if we are sitting in the demo loop w/ no power inputs
       updateCoastingStats();
     } else {
       // we are cranking away
       updateGrade();
-      updateGearGraphic();
       updatePower();
-      //updateStats();
+      updateGearGraphic();
+      updateCrankAnimation(currentMillis);
       drawDividers();
     }
   }
@@ -509,28 +661,28 @@ void updateDisplayViaSprite(){
   // UPDATING WEIGHT MODE
 
   if (inputMode == inputWeightMode) {
-    imgSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_DARKGREEN);
-    imgSprite.setTextColor(TFT_WHITE, TFT_DARKGREEN);
-    imgSprite.drawString("Weight in KGs: " + String(inputWeightKGs), 10,10,4 );
-    imgSprite.drawString("Use buttons to increase / decrease weight.", 20, 70, 2);
-    imgSprite.drawString("Input range is " + String(minWeight) + " to " + String(maxWeight) + " KGs", 20, 90, 2);
-    imgSprite.drawString("Press both buttons to move to FTP setting.", 20, 110, 2);
+    imgMainSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_DARKGREEN);
+    imgMainSprite.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+    imgMainSprite.drawString("Weight in KGs: " + String(inputWeightKGs), 10,10,4 );
+    imgMainSprite.drawString("Use buttons to increase / decrease weight.", 20, 70, 2);
+    imgMainSprite.drawString("Input range is " + String(minWeight) + " to " + String(maxWeight) + " KGs", 20, 90, 2);
+    imgMainSprite.drawString("Press both buttons to move to FTP setting.", 20, 110, 2);
 
   }
 
     // UPDATING FTP MODE
 
   if (inputMode == inputFTPMode) {
-    imgSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_DARKCYAN);
-    imgSprite.setTextColor(TFT_WHITE, TFT_DARKCYAN);
-    imgSprite.drawString("FTP in Watts: " + String(inputFTP), 10,10,4 );
-    imgSprite.drawString("Use buttons to increase / decrease FTP.", 20, 70, 2);
-    imgSprite.drawString("Input range is " + String(minFTP) + " to " + String(maxFTP) + " watts", 20, 90, 2);
-    imgSprite.drawString("Press both buttons to save settings", 20, 110, 2);
-    imgSprite.drawString("and return to normal mode.", 20, 130, 2);
+    imgMainSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, TFT_DARKCYAN);
+    imgMainSprite.setTextColor(TFT_WHITE, TFT_DARKCYAN);
+    imgMainSprite.drawString("FTP in Watts: " + String(inputFTP), 10,10,4 );
+    imgMainSprite.drawString("Use buttons to increase / decrease FTP.", 20, 70, 2);
+    imgMainSprite.drawString("Input range is " + String(minFTP) + " to " + String(maxFTP) + " watts", 20, 90, 2);
+    imgMainSprite.drawString("Press both buttons to save settings", 20, 110, 2);
+    imgMainSprite.drawString("and return to normal mode.", 20, 130, 2);
   }
 
-  imgSprite.pushSprite(0,0);  // update the physical screen
+  imgMainSprite.pushSprite(0,0);  // update the physical screen
 }
 /* end void loop()---------------------------------------------------------------------------------------------------------*/
 void checkButtons() {
@@ -540,36 +692,38 @@ void checkButtons() {
   #define inputFTPMode 2
   */
   static long lastInputToggleTime;
-
-
+  static long lastSingleButtonPressNormalMode = 0;
+  long currentMillis = long(millis());
   int intBottomButtonState = digitalRead(BOTTOM_BUTTON_PIN); // watts or w/kg
   int intTopButtonState = digitalRead(TOP_BUTTON_PIN);
-
   // simultaneous button presses - toggles dingus thru the modes for normal uses, ftp input or weight input
   if ((intTopButtonState == LOW) && (intBottomButtonState == LOW)) {
-    long currentTime = millis();
-    // make sure it has been at least three seconds since the last toggle between setting inputs, so we don't 
-    // chase out tail immediately toggling back to inputs
-    if (currentTime > lastInputToggleTime + 3000) {
-      lastInputToggleTime = currentTime;
+    if (! demoMode) { // if we are in demo mode, disable ftp and weight modes
+      // make sure it has been at least three seconds since the last toggle between setting inputs, so we don't 
+      // chase out tail immediately toggling back to inputs
+      if (currentMillis > lastInputToggleTime + 3000) {
+        lastInputToggleTime = currentMillis;
 
-      if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputNormalMode) ) {
-        inputMode = inputWeightMode;
-        delay(50);
-      } else if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputWeightMode) ) {
-        inputMode = inputFTPMode;
-        delay(50);
-      } else if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputFTPMode) ) {
-        // exiting input mode, save state
-        saveEEPROMSettings();
-        inputMode = inputNormalMode;
-        delay(50);
-      }
-    } // currentTime > lastinputToggleTime + 3000
+        if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputNormalMode) ) {
+          // leave normal mode and switch to the first screen of input mode
+          inputMode = inputWeightMode;
+          delay(50);
+        } else if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputWeightMode) ) {
+          // leave the 1st screen of input mode (weight) and move onto FTP
+          inputMode = inputFTPMode;
+          delay(50);
+        } else if ((intTopButtonState == LOW) && (intBottomButtonState == LOW) && (inputMode == inputFTPMode) ) {
+          // leaving FTP input, exiting input mode, save state and return to normal mode
+          saveEEPROMSettings();
+          inputMode = inputNormalMode;
+          delay(50);
+        }
+      } // currentMillis > lastinputToggleTime + 3000
+    } // ! demoMode 
   } else {  //single or no press - meaning depends on mode
     if (intBottomButtonState == LOW)
     {
-      if (inputMode == inputNormalMode) {
+      if (inputMode == inputNormalMode && currentMillis > lastSingleButtonPressNormalMode + 1000) {
         // toggles thru Watts, W/KG FTP
         intWattsOrWKgOrFTP++;
         if (intWattsOrWKgOrFTP > powerFTP) intWattsOrWKgOrFTP = powerWatts;
@@ -578,7 +732,8 @@ void checkButtons() {
         // throughout your rides, say, 10x per ride, and ride daily, you would only be looking at 3 years before you reach that 10k
         // otherwise, whatever settings are in effect for power mode and watts vs w/kg get save when you update your ftp / weight
         // saveEEPROMSettings()  
-        delay(50); // only want this for normal mode, in input mode, we want a held button to register
+        lastSingleButtonPressNormalMode = currentMillis;
+        //delay(50);
       } 
       if (inputMode == inputWeightMode) { 
         // decrease weight
@@ -595,12 +750,14 @@ void checkButtons() {
         
     if (intTopButtonState == LOW)
     {
-      if (inputMode == inputNormalMode) {
+      if (inputMode == inputNormalMode && currentMillis > lastSingleButtonPressNormalMode + 1000)  {
         // rotate instant, 3s or 10s power
         powerAvgMode++;
         if (powerAvgMode > 2) powerAvgMode = 0;
         // saveEEPROMSettings() // see comment above
-        delay(50);  // only want this for normal mode, in input mode, we want a held button to register
+        //delay(50);  // only want this for normal mode, in input mode, we want a held button to register
+        lastSingleButtonPressNormalMode = currentMillis;
+        //delay(50);
       }
       if (inputMode == inputWeightMode){
         // increase weight
@@ -620,23 +777,31 @@ void checkButtons() {
 /*-----------------------------------------------------------------------------------------------------------*/
 void updateCoastingStats() {
   // draw an outer board based on the max power, with a nested inner border based on the average
-  imgSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, getColorBasedOnFTPPct(100 * maxPowerArray[powerAvgMode] /inputFTP));
+  imgMainSprite.fillRect(0,0,RESOLUTION_X, RESOLUTION_Y, getColorBasedOnFTPPct(100 * maxPowerArray[powerAvgMode] /inputFTP));
   if (powerObservationsArray[powerAvgMode] > 0) {
-    imgSprite.fillRect(3,3,RESOLUTION_X - 3, RESOLUTION_Y - 3, getColorBasedOnFTPPct(100 * avgDurationPower()/inputFTP));
+    imgMainSprite.fillRect(3,3,RESOLUTION_X - 6, RESOLUTION_Y - 6, getColorBasedOnFTPPct(100 * avgDurationPower()/inputFTP));
   }
 
   // inset a smaller rectangle
-  imgSprite.fillRect(7, 7, RESOLUTION_X - 14, RESOLUTION_Y - 14, TFT_BLACK);
+  imgMainSprite.fillRect(7, 7, RESOLUTION_X - 14, RESOLUTION_Y - 14, TFT_BLACK);
+
+  // put a power distribution chart in the lower right corner
+  // addn 7 offset to avoid overwriting the border
+  drawPowerDistributionChart(RESOLUTION_X/3, 70, RESOLUTION_X - RESOLUTION_X/3 - 7, RESOLUTION_Y - 70 - 7);
+
+  // superimpose max / avg stats, pedaling time and ftp/weight
   setTextColorBasedOnFTPPct(100 * maxPowerArray[powerAvgMode] /inputFTP);
-  imgSprite.drawString("Max " + getDurationMode() + ": "  + getPowerInSelectedUnits(maxPowerArray[powerAvgMode]) + " " + getWattsOrWKGLabel() , 14, 10, 4);
+  imgMainSprite.drawString("Max " + getDurationMode() + ": "  + getPowerInSelectedUnits(maxPowerArray[powerAvgMode]) + " " + getWattsOrWKGLabel() , 14, 10, 4);
 
   setTextColorBasedOnFTPPct(100 * avgDurationPower()/inputFTP);
-  imgSprite.drawString("Avg " + getDurationMode() + ": " + getPowerInSelectedUnits(avgDurationPower()) + " " + getWattsOrWKGLabel(), 14, 50, 4);
+  imgMainSprite.drawString("Avg " + getDurationMode() + ": " + getPowerInSelectedUnits(avgDurationPower()) + " " + getWattsOrWKGLabel(), 14, 40, 4);
 
   setDefaultTextColor();
   // pedaling time should always be instant
-  imgSprite.drawString("Pedaling: " + secondsToFormattedTime(powerObservationsArray[avgInstant]), 14, 90, 4);
-  imgSprite.drawString("Weight: " + String(inputWeightKGs) + "  FTP: " + String(inputFTP), 14, 130, 4);
+  imgMainSprite.drawString("Elapsed:  " + secondsToFormattedTime(long(millis()/1000)), 14, 75, 2);
+  imgMainSprite.drawString("Pedaling: " + secondsToFormattedTime(powerObservationsArray[avgInstant]), 14, 90, 2);
+  imgMainSprite.drawString("Weight: " + String(inputWeightKGs), 14, 120, 2);
+  imgMainSprite.drawString("FTP: " + String(inputFTP), 14, 140, 2);
 }
 
 
@@ -665,11 +830,45 @@ String secondsToFormattedTime(long secs) {
   return String(buffer);
 }
 void drawDividers() {
-  imgSprite.drawLine(RESOLUTION_X/2 - 10, 0, RESOLUTION_X/2 - 10, RESOLUTION_Y, TFT_DARKGREY); //draw left border of chart
-  imgSprite.drawLine(RESOLUTION_X/2 + 10, 0, RESOLUTION_X/2 + 10, RESOLUTION_Y, TFT_DARKGREY); // draw right border of chart
+  imgMainSprite.drawLine(RESOLUTION_X/2 - 10, 0, RESOLUTION_X/2 - 10, RESOLUTION_Y, TFT_DARKGREY); //draw left border of chart
+  imgMainSprite.drawLine(RESOLUTION_X/2 + 10, 0, RESOLUTION_X/2 + 10, RESOLUTION_Y, TFT_DARKGREY); // draw right border of chart
   
-  imgSprite.drawLine(0, 68, RESOLUTION_X/2 - 10, 66, TFT_DARKGREY); // draw a left  horizontal divider
-  imgSprite.drawLine(RESOLUTION_X/2 + 10 + 40, 96, RESOLUTION_X - 40, 96, TFT_DARKGREY); // draw a right partial horizontal divider
+  imgMainSprite.drawLine(0, 68, RESOLUTION_X/2 - 10, 66, TFT_DARKGREY); // draw a left  horizontal divider
+  imgMainSprite.drawLine(RESOLUTION_X/2 + 10 + 40, 96, RESOLUTION_X - 40, 96, TFT_DARKGREY); // draw a right partial horizontal divider
+}
+/*-------------------------------------------------------------------------------------------------------------------*/
+void updateCrankAnimation(long currentMillis) {
+  // added Jan 14, 2024
+  // simple rotation inset to crank
+  // draws a simple crankset overlay with 3 normal arms, and one longer drivetrain side crank arm
+  // gets overlaid on the gear graphic and then rotated based on the current cadence
+  // note that any color can serve as transparent, it just needs to match the color specified in the call pushRotated()
+  imgCrankInset.fillSprite(TFT_TRANSPARENT); // "clear" the sprite
+  int centerXOrY = (2 * crankExtensionBeyondRing + crankInsetSize) / 2;
+  int halfInsetSize = crankInsetSize/2;
+  int nonCrankArmLength = halfInsetSize - 5;
+ // top vertical member - draw the outer shape, and an inner wedge in "Transparent" - 
+  imgCrankInset.drawWedgeLine(centerXOrY, centerXOrY - nonCrankArmLength, centerXOrY, centerXOrY, 4, 10, TFT_SILVER);
+  imgCrankInset.drawWedgeLine(centerXOrY, centerXOrY - nonCrankArmLength, centerXOrY, centerXOrY, 1, 5, TFT_TRANSPARENT);
+  // bottom vertical member
+  imgCrankInset.drawWedgeLine(centerXOrY, centerXOrY, centerXOrY, centerXOrY + nonCrankArmLength, 10, 4, TFT_SILVER);
+  imgCrankInset.drawWedgeLine(centerXOrY, centerXOrY, centerXOrY, centerXOrY + nonCrankArmLength, 5, 1, TFT_TRANSPARENT);
+  // left horizontal member
+  imgCrankInset.drawWedgeLine(centerXOrY - nonCrankArmLength, centerXOrY, centerXOrY, centerXOrY, 4, 10, TFT_SILVER);
+  imgCrankInset.drawWedgeLine(centerXOrY - nonCrankArmLength, centerXOrY, centerXOrY, centerXOrY, 1, 5, TFT_TRANSPARENT);
+  // right horizontal member - will be crank arm and extend beyond the outer ring 
+  imgCrankInset.drawWedgeLine(centerXOrY, centerXOrY, centerXOrY + halfInsetSize + crankExtensionBeyondRing, centerXOrY, 10, 4 , TFT_SILVER);
+  // give the crank arm a color stripe (FSA?) based on the power zone
+  imgCrankInset.drawWedgeLine(centerXOrY, centerXOrY, centerXOrY + halfInsetSize + crankExtensionBeyondRing, centerXOrY, 5, 1,  0xB924); // dark red inset
+  
+  // convert cadence in RPM to revs per second (divide by 60), make one RPS equal to a full revolution 
+  //  (360 degrees) then multiple by the fraction (or mulitple) of full seconds since the last update
+  //Serial.println("crankAngle:" + String(crankAngle) + " currentcadence:" + String(currentCadence) + " lastMillis:" + String(lastCrankUpdateMillis) + " currentMillis:" + String(currentMillis));
+  crankAngle +=  int( float(360.0 * (getCurrentCadence() / 60.0)) * float((currentMillis - lastCrankUpdateMillis) / 1000.0));
+  // we may have done more than one full revolution or just bumped past 360 degrees so perform a mod
+  crankAngle = int(crankAngle % 360);
+  imgCrankInset.pushRotated(&imgMainSprite, crankAngle, TFT_TRANSPARENT); // last arg is color to make transparent  
+  lastCrankUpdateMillis = currentMillis;
 }
 /*-------------------------------------------------------------------------------------------------------------------*/
 void updateGearGraphic() {
@@ -677,18 +876,8 @@ void updateGearGraphic() {
   //              Includes primitive jockey ring animation
   // these should all be even numbers, since they get divided by 2
   // 1/5/2024 - moved to lower right
-
-  #define rearGearX 28
-  #define rearGearY 118 // was 42
-  #define rearMinSize 6
-  #define rearGearSpacing 1
-  #define frontGearX 110
-  #define frontGearY 128 // was 50
-  #define frontMinSize  20
-  #define frontGearSpacing 10
-  #define jockeyWheelSize 4
-  //#define numRearGears 11
-  //#define numChainRings 2
+  // 1/20/2024 - switched chain path on cassette and crankset to arcs, switched to using drawWideLine()
+  //              rather than literally drawing two lines side by side
   uint32_t fillColor = TFT_LIGHTGREY; // cog and jockey wheeler color
   // default chain color is green, but override for lowest gears
   uint32_t highLightColor = TFT_GREEN;
@@ -696,47 +885,60 @@ void updateGearGraphic() {
   if (currentCassette == 3 && currentChainRing == 1) highLightColor = TFT_YELLOW;
   if (currentCassette == 2 && currentChainRing == 1) highLightColor = TFT_ORANGE;
   if (currentCassette == 1 && currentChainRing == 1) highLightColor = TFT_RED;
-  //gear text
-  imgSprite.setTextColor(highLightColor, TFT_BLACK);
-  imgSprite.drawString(String(currentChainRing) + ":" + String(currentCassette), 0, 72, 4);  
+  //gear and cadence text
+  imgMainSprite.setTextColor(highLightColor, TFT_BLACK);
+  imgMainSprite.drawString(String(currentChainRing) + ":" + String(currentCassette), 0, 72, 4);  
+  imgMainSprite.drawString(String(getCurrentCadence()) + " rpm", frontGearX - 40, 72, 4);
   setDefaultTextColor();
-  // rear cassette
+  // rear cassettefrontMinSize
   for (int i = numRearGears - 1; i >= 0; i --){
-      fillColor = TFT_LIGHTGREY;
-      if (i == currentCassette - 1) fillColor = highLightColor;
-      imgSprite.drawCircle(rearGearX, rearGearY,  ((numRearGears - i) * rearGearSpacing) + rearMinSize, fillColor);
-      //delay(100);
+      // 1/20/2024 - switched to drawing the "chain" as a semi-circle onto top of the chain ring
+      imgMainSprite.drawCircle(rearGearX, rearGearY,  ((numRearGears - i) * rearGearSpacing) + rearMinSize, TFT_LIGHTGREY);
+      if (i == currentCassette - 1){
+         imgMainSprite.drawSmoothArc(rearGearX, rearGearY, ((numRearGears - i) * rearGearSpacing) + rearMinSize,
+                ((numRearGears - i) * rearGearSpacing) + rearMinSize - 1, 0, 180, highLightColor, TFT_BLACK);
+      }
   }
   // front chainrings
   for (int i = 0; i < numFrontGears; i ++){
-      fillColor = TFT_LIGHTGREY;
-      if (i == currentChainRing -1) fillColor = highLightColor;
-      imgSprite.drawCircle(frontGearX, frontGearY, (i*frontGearSpacing) + frontMinSize, fillColor);
-      imgSprite.drawCircle(frontGearX, frontGearY, (i*frontGearSpacing) + frontMinSize-1, fillColor);
-      //delay(100);
+      imgMainSprite.drawCircle(frontGearX, frontGearY, (i*frontGearSpacing) + frontMinSize, TFT_LIGHTGREY);
+      imgMainSprite.drawCircle(frontGearX, frontGearY, (i*frontGearSpacing) + frontMinSize-1, TFT_LIGHTGREY);
+      // 1/20/2024 - switched to drawing the "chain" as a semi-circle onto top of the chain ring
+      if (i == currentChainRing -1) {
+        imgMainSprite.drawSmoothArc(frontGearX, frontGearY, (i*frontGearSpacing) + frontMinSize,
+                  (i*frontGearSpacing) + frontMinSize - 1, 180, 0, highLightColor, TFT_BLACK);
+      } 
+      
   }
   // top chain - note I double this line up for visibility
-  imgSprite.drawLine(rearGearX, rearGearY - (((numRearGears - currentCassette + 1) * rearGearSpacing) + rearMinSize)  - 1,   frontGearX,   frontGearY - (((currentChainRing -1) * frontGearSpacing) + frontMinSize) - 1, highLightColor);
-  imgSprite.drawLine(rearGearX, rearGearY - (((numRearGears - currentCassette + 1) * rearGearSpacing) + rearMinSize),   frontGearX,   frontGearY - (((currentChainRing -1) * frontGearSpacing) + frontMinSize), highLightColor);
+  imgMainSprite.drawWideLine(rearGearX, rearGearY - (((numRearGears - currentCassette + 1) * rearGearSpacing) + rearMinSize),   
+                  frontGearX,   frontGearY - (((currentChainRing -1) * frontGearSpacing) + frontMinSize), 2, highLightColor);
   
    //upper jockey wheel
   int upperJockeyX = rearGearX + (numRearGears * rearGearSpacing);
   int upperJockeyY = rearGearY + (numRearGears * rearGearSpacing) + rearMinSize + 4;
-  imgSprite.drawCircle(upperJockeyX, upperJockeyY, jockeyWheelSize, TFT_LIGHTGREY);
+  imgMainSprite.drawCircle(upperJockeyX, upperJockeyY, jockeyWheelSize, TFT_LIGHTGREY);
   // chain rear gear to upper jockey wheel, doubled
-  imgSprite.drawLine(rearGearX, rearGearY + (rearMinSize/2) + (((numRearGears -(currentCassette -1))* rearGearSpacing)) + 3  , upperJockeyX, upperJockeyY - (jockeyWheelSize / 2) - 2, highLightColor);
-  imgSprite.drawLine(rearGearX, rearGearY + (rearMinSize/2) + (((numRearGears -(currentCassette -1))* rearGearSpacing)) + 2  , upperJockeyX, upperJockeyY - (jockeyWheelSize / 2) - 1, highLightColor);
+  imgMainSprite.drawWideLine(rearGearX, rearGearY + (rearMinSize/2) + (((numRearGears -(currentCassette -1))* rearGearSpacing)) + 2, 
+              upperJockeyX, upperJockeyY - (jockeyWheelSize / 2) - 2, 2, highLightColor);
+  
   // lower jockey wheel - this one moves according to gear combo
   int lowerJockeyX = upperJockeyX - numRearGears +  (2 * (numRearGears - currentCassette));
   int lowerJockeyY = upperJockeyY + (jockeyWheelSize * 2);
   if (currentChainRing == 1) lowerJockeyY = lowerJockeyY + jockeyWheelSize;
-  imgSprite.drawCircle(lowerJockeyX, lowerJockeyY, jockeyWheelSize, TFT_LIGHTGREY);
+  imgMainSprite.drawCircle(lowerJockeyX, lowerJockeyY, jockeyWheelSize, TFT_LIGHTGREY);
   // upper to lower jockey wheel, doubled
-  imgSprite.drawLine(upperJockeyX, upperJockeyY + (jockeyWheelSize/2) + 2, lowerJockeyX, lowerJockeyY - (jockeyWheelSize/2) - 2, highLightColor);
-  imgSprite.drawLine(upperJockeyX, upperJockeyY + (jockeyWheelSize/2) + 1, lowerJockeyX, lowerJockeyY - (jockeyWheelSize/2) - 1, highLightColor);
+  /*imgMainSprite.drawLine(upperJockeyX, upperJockeyY + (jockeyWheelSize/2) + 2, lowerJockeyX, lowerJockeyY - (jockeyWheelSize/2) - 2, highLightColor);
+  imgMainSprite.drawLine(upperJockeyX, upperJockeyY + (jockeyWheelSize/2) + 1, lowerJockeyX, lowerJockeyY - (jockeyWheelSize/2) - 1, highLightColor);
+  */
+  imgMainSprite.drawWideLine(upperJockeyX, upperJockeyY + (jockeyWheelSize/2) + 1, 
+              lowerJockeyX, lowerJockeyY - (jockeyWheelSize/2) - 1, 2, highLightColor);
   // lower jockey wheel to bottom of front gear, doubled up again for visibility
-  imgSprite.drawLine(lowerJockeyX, lowerJockeyY + jockeyWheelSize + 1,   frontGearX,   frontGearY + (((currentChainRing -1) * frontGearSpacing) + frontMinSize) + 1, highLightColor);
-  imgSprite.drawLine(lowerJockeyX, lowerJockeyY + jockeyWheelSize,   frontGearX,   frontGearY + (((currentChainRing -1) * frontGearSpacing) + frontMinSize), highLightColor);
+  imgMainSprite.drawWideLine(lowerJockeyX, lowerJockeyY + jockeyWheelSize,   frontGearX,   
+            frontGearY + (((currentChainRing -1) * frontGearSpacing) + frontMinSize), 2, highLightColor);
+ 
+
+
 }
 
 /*------------------------------------------------------------------------------------------------------------*/
@@ -744,9 +946,9 @@ void updateGrade(void) {
   //Grade moved to upper right corner
   // if the bike is locked, display that in red, otherwise display the grade
   if (tilt_lock) {
-    imgSprite.setTextColor(TFT_RED, TFT_BLACK);
-    imgSprite.drawString("Tilt",0, 0, 4);
-    imgSprite.drawString("Locked",0, 25, 4);
+    imgMainSprite.setTextColor(TFT_RED, TFT_BLACK);
+    imgMainSprite.drawString("Tilt",0, 0, 4);
+    imgMainSprite.drawString("Locked",0, 25, 4);
   } else {
       uint32_t gradeColor = TFT_SKYBLUE;
       if (currentGrade < -2) {
@@ -765,61 +967,63 @@ void updateGrade(void) {
       }
       char buffer[7];
       dtostrf(currentGrade, 5,1, buffer);
-      imgSprite.setTextColor(gradeColor, TFT_BLACK);
-      imgSprite.drawString("% Grade", 0, 0, 2);
-      imgSprite.drawString(String(buffer), 0, 16, 7);
+      imgMainSprite.setTextColor(gradeColor, TFT_BLACK);
+      imgMainSprite.drawString("% Grade", 0, 0, 2);
+      imgMainSprite.drawString(String(buffer), 0, 16, 7);
       
     }
   setDefaultTextColor(); // reset text color
 }
 /*------------------------------------------------------------------------------------------------------------*/
 void updatePower(void) {
-    // moved to upper left
-      
-      
-      String unitPrefix = getDurationMode();
-      int p;
-      p = 0;
-      if (powerAvgMode == avg3Secs) {
-        for (int i = 0; i < 3; i++) p = p + avgBySecond[i];
-        p = p / 3;
-      } else if (powerAvgMode == avg10Secs) {
-        for (int i = 0; i < 10; i++) p = p + avgBySecond[i];
-        p = p / 10;
-      } else {
-        // instant power
-        p = currentPower;
-      }
-      // convert whichever type of power is being displayed to FTP percent      
-      int ftpPct = int((100 * p) / inputFTP);
-      String powerDesc = getPowerZoneDesc(ftpPct);
-      setTextColorBasedOnFTPPct(ftpPct);
-      imgSprite.drawString(powerDesc, RESOLUTION_X/2 + 18, 0, 2);
+  static boolean showMaxAvg = true;
+  static long lastPowerToggleSecond = 0;
 
-      imgSprite.drawString(getPowerInSelectedUnits(p), RESOLUTION_X/2  + 16 ,14, 7);
-      imgSprite.drawString(unitPrefix + getWattsOrWKGLabel() ,RESOLUTION_X/2 + 24 , 64, 4); 
-      
+  long secsSinceStart = long(millis()/1000);
+  String unitPrefix = getDurationMode();
+  int p;
+  p = 0;
+  if (powerAvgMode == avg3Secs) {
+    for (int i = 0; i < 3; i++) p = p + avgPowerBySecond[i];
+    p = p / 3;
+  } else if (powerAvgMode == avg10Secs) {
+    for (int i = 0; i < 10; i++) p = p + avgPowerBySecond[i];
+    p = p / 10;
+  } else {
+    // instant power
+    p = currentPower;
+  }
+  // convert whichever type of power is being displayed to FTP percent      
+  int ftpPct = int((100 * p) / inputFTP);
+  String powerDesc = getPowerZoneDesc(ftpPct);
+  setTextColorBasedOnFTPPct(ftpPct);
+  imgMainSprite.drawString(powerDesc, RESOLUTION_X/2 + 18, 0, 2);
 
-      // MAX and AVG Power
-      setTextColorBasedOnFTPPct(100 * maxPowerArray[powerAvgMode]/inputFTP);
-      imgSprite.drawString("Max:" + getPowerInSelectedUnits(maxPowerArray[powerAvgMode]) , RESOLUTION_X/2  + 24, 100, 4);
+  imgMainSprite.drawString(getPowerInSelectedUnits(p), RESOLUTION_X/2  + 16 ,14, 7);
+  imgMainSprite.drawString(unitPrefix + " " + getWattsOrWKGLabel() ,RESOLUTION_X/2 + 24 , 64, 4); 
+  
+  // 3 seconds, alternate displaying max/avg power or power distribution chart
+  if (secsSinceStart > lastPowerToggleSecond + 3) {
+    showMaxAvg = ! showMaxAvg;
+    lastPowerToggleSecond = secsSinceStart;
+  }
 
-      //
-
-      setTextColorBasedOnFTPPct(100 * avgDurationPower()/inputFTP);
-      imgSprite.drawString("Avg:" + getPowerInSelectedUnits(avgDurationPower()), RESOLUTION_X/2  + 24, 124, 4);
-
-      setDefaultTextColor();
-      //imgSprite.drawString("Weight: " + String(inputWeightKGs) + "  FTP: " + String(inputFTP), 5, 130, 2);
-      long secsSinceStart = long(millis()/1000);
-      
-      imgSprite.drawString("Elapsed: " + secondsToFormattedTime(secsSinceStart) , RESOLUTION_X/2  + 24, RESOLUTION_Y - 15, 2); // but the time since boot in lower left corner in tiny type
-
-
-
-
-
-      drawPowerChart(ftpPct);
+  if (showMaxAvg){
+    // MAX and AVG Power and elapsed time
+    setTextColorBasedOnFTPPct(100 * maxPowerArray[powerAvgMode]/inputFTP);
+    imgMainSprite.drawString("Max:" + getPowerInSelectedUnits(maxPowerArray[powerAvgMode]) , RESOLUTION_X/2  + 24, 100, 4);
+    setTextColorBasedOnFTPPct(100 * avgDurationPower()/inputFTP);
+    imgMainSprite.drawString("Avg:" + getPowerInSelectedUnits(avgDurationPower()), RESOLUTION_X/2  + 24, 124, 4);
+    imgMainSprite.drawString("Elapsed: " + secondsToFormattedTime(secsSinceStart) , RESOLUTION_X/2  + 24, RESOLUTION_Y - 20, 2);
+  } else {
+    drawPowerDistributionChart(RESOLUTION_X/2 + 24, 100, RESOLUTION_X - (RESOLUTION_X/2 + 24), RESOLUTION_Y - 100);
+    
+  }
+  setDefaultTextColor();
+  //imgMainSprite.drawString("Weight: " + String(inputWeightKGs) + "  FTP: " + String(inputFTP), 5, 130, 2);
+  
+  
+  drawCurrentPowerGraphic(ftpPct);
   setDefaultTextColor();
 }
 /*---------------------------------------------------------------------------------------------*/
@@ -867,15 +1071,15 @@ String getWattsOrWKGLabel(){
   }
 }
 /*---------------------------------------------------------------------------------------------*/
-void drawPowerChart(int ftpPct) {
+void drawCurrentPowerGraphic(int ftpPct) {
   // 1/5/2024 - moved to center of display
-  //Serial.println("drawPowerChart, ftpPct:" + String(ftpPct));
+  //Serial.println("drawCurrentPowerGraphic, ftpPct:" + String(ftpPct));
   // expects power as integer pct of FTP
   uint32_t zChartColor = getColorBasedOnFTPPct(ftpPct);
   int h = getChartHeightBasedOnFTP(ftpPct);
   // deal with the ftp power bar display on the far right
-  imgSprite.fillRect(RESOLUTION_X/2 - 10, 0, 20, RESOLUTION_Y, TFT_BLACK);
-  imgSprite.fillRect(RESOLUTION_X/2 - 10, RESOLUTION_Y - h, 20, h, zChartColor);
+  imgMainSprite.fillRect(RESOLUTION_X/2 - 10, 0, 20, RESOLUTION_Y, TFT_BLACK);
+  imgMainSprite.fillRect(RESOLUTION_X/2 - 10, RESOLUTION_Y - h, 20, h, zChartColor);
 
   // draw indicators for the power thresholds, we don't need the 0th threshold
   for (int i = 1; i < numPowerZones; i++) setPowerZoneIndicator(powerZoneThreshold[i]);
@@ -885,7 +1089,7 @@ void drawPowerChart(int ftpPct) {
   // max triangle is point down
   int topY = max(RESOLUTION_Y - getChartHeightBasedOnFTP(int((100 * maxPowerArray[powerAvgMode])/inputFTP)),0);
   int bottomY = min(topY + 10, RESOLUTION_Y);
-  imgSprite.fillTriangle(RESOLUTION_X/2 - 8, topY, RESOLUTION_X/2 + 8, topY, RESOLUTION_X/2, bottomY, getColorBasedOnFTPPct(int((100 * maxPowerArray[powerAvgMode])/inputFTP)));
+  imgMainSprite.fillTriangle(RESOLUTION_X/2 - 8, topY, RESOLUTION_X/2 + 8, topY, RESOLUTION_X/2, bottomY, getColorBasedOnFTPPct(int((100 * maxPowerArray[powerAvgMode])/inputFTP)));
 
   if (powerObservationsArray[powerAvgMode] > 0){
     // avg power (in motion) is powerCumulativeTotalArray[powerAvgMode]/powerObservationsArray[powerAvgMode] - convert to FTP to work with the chart
@@ -893,23 +1097,67 @@ void drawPowerChart(int ftpPct) {
     topY = max(RESOLUTION_Y - getChartHeightBasedOnFTP(int(100 * avgDurationPower()/inputFTP)), 0);
     bottomY = min(topY + 10, RESOLUTION_Y);
     if (avgDurationPower() > currentPower) {
-      imgSprite.fillTriangle(RESOLUTION_X/2 - 8, bottomY, RESOLUTION_X/2 + 8, bottomY, RESOLUTION_X/2, topY, 
+      imgMainSprite.fillTriangle(RESOLUTION_X/2 - 8, bottomY, RESOLUTION_X/2 + 8, bottomY, RESOLUTION_X/2, topY, 
         getColorBasedOnFTPPct(int(100 * avgDurationPower()/inputFTP)));
     } else {
       // currentPower is greater than average power, which means the average marker will be superimposed on the power bar - so make it black to standout
-      imgSprite.fillTriangle(RESOLUTION_X/2 - 8, bottomY, RESOLUTION_X/2 + 8, bottomY, RESOLUTION_X/2, topY, TFT_BLACK);
+      imgMainSprite.fillTriangle(RESOLUTION_X/2 - 8, bottomY, RESOLUTION_X/2 + 8, bottomY, RESOLUTION_X/2, topY, TFT_BLACK);
     }
   }
-  
 }
+/*---------------------------------------------------------------------------------------------*/
+void drawPowerDistributionChart(int chartX, int chartY, int chartW, int chartH) {
+  // draws a power distribution chart (amount of time in each power zone) with the x,y, w (width),
+  // h (height) coordinates
+  // leverages long secsInPowerZone[numPowerZones]
+  //Serial.println("drawPowerDistributionChart called w:" + String(chartX) + " " + String(chartY) + " " + String(chartW) + " " + String(chartH));
+
+  long totalTime = 0;
+  long maxTime = 0;
+  for (int i = 0; i < numPowerZones; i++) {
+    totalTime += secsInPowerZone[i];
+    maxTime = max(maxTime, secsInPowerZone[i]);
+  }
+  //Serial.println("totalTime:" + String(totalTime) + " maxTime:" + String(maxTime));
+
+  
+  if (totalTime > 0 && maxTime > 0) {
+    //
+    float scaleY = float(chartH) / float(maxTime);
+    //Serial.println("scaleY * 1000:" + String(int(1000.0 * scaleY)));
+
+    // figure out the width of each bar, leaving room for a separator
+
+    int zoneW = int((chartW  - (numPowerZones * 4))/numPowerZones);
+    
+    int left = chartX + 1;
+    for (int i = 0; i < numPowerZones; i++) {
+      //Serial.println("secs in zone:" + String(secsInPowerZone[i]));
+      int barHeight = int(scaleY * secsInPowerZone[i]);
+      // need to invert the Y logic, since 0,0 is top left, not bottom left
+      int topY = chartY +  (chartH - barHeight);
+      //Serial.println("left:" + String(left) + " barHeight:" + String(barHeight) + " topY:" + String(topY));
+      if (barHeight > 0) imgMainSprite.fillRect(left, topY, zoneW, barHeight, getColorBasedOnFTPPct(powerZoneThreshold[i] + 1));
+      left = left + zoneW + 2;
+      imgMainSprite.drawLine(left, chartY + chartH - 3, left, chartY + chartH, TFT_WHITE);
+      left += 2;
+    }
+  }
+  // superimpose a small Z Dist label on the power distribution chart - wish this could have a transparent background
+  setTextColorBasedOnFTPPct(5);  // will evaluate to light grey
+  imgMainSprite.drawString("Z Dist.", chartX + chartW - 50, chartY, 2);
+  setDefaultTextColor();
+}
+
+
 /*---------------------------------------------------------------------------------------------*/
 void setPowerZoneIndicator(int ftpPct) {
   //Serial.println("setPowerZoneIndicator, ftpPct:" + String(ftpPct));
   // draw a pair of marking indicators, 4 pixels long on the left and right side of the power chart
   // 1/5/2024 - moved to center of dingus, with the power chart centered on resolution_x/2 +- 10 pixels
   int y = RESOLUTION_Y - getChartHeightBasedOnFTP(ftpPct);
-  imgSprite.drawLine(RESOLUTION_X/2 - 10, y, RESOLUTION_X/2 - 7, y, getColorBasedOnFTPPct(ftpPct));
-  imgSprite.drawLine(RESOLUTION_X/2 + 7, y, RESOLUTION_X/2 + 10, y, getColorBasedOnFTPPct(ftpPct));
+  imgMainSprite.drawLine(RESOLUTION_X/2 - 10, y, RESOLUTION_X/2 - 7, y, getColorBasedOnFTPPct(ftpPct));
+  imgMainSprite.drawLine(RESOLUTION_X/2 + 7, y, RESOLUTION_X/2 + 10, y, getColorBasedOnFTPPct(ftpPct));
 }
 /*---------------------------------------------------------------------------------------------*/
 int getChartHeightBasedOnFTP(int ftpPct){
@@ -928,11 +1176,11 @@ int getChartHeightBasedOnFTP(int ftpPct){
 /*---------------------------------------------------------------------------------------------*/
 void setTextColorBasedOnFTPPct(int ftpPct){
   //Serial.println("setTextColorBasedOnFTPPct, ftpPct:" + String(ftpPct));
-  imgSprite.setTextColor(getColorBasedOnFTPPct(ftpPct), TFT_BLACK);
+  imgMainSprite.setTextColor(getColorBasedOnFTPPct(ftpPct), TFT_BLACK);
 }
 /*---------------------------------------------------------------------------------------------*/
 void setDefaultTextColor() {
-  imgSprite.setTextColor(TFT_SKYBLUE, TFT_BLACK);
+  imgMainSprite.setTextColor(TFT_SKYBLUE, TFT_BLACK);
 }
 /*---------------------------------------------------------------------------------------------*/
 uint32_t getColorBasedOnFTPPct(int ftpPct) {
@@ -957,7 +1205,35 @@ String getPowerZoneDesc(int ftpPct) {
   }
   return "Coasting / Stopped";
 }
-
+/*---------------------------------------------------------------------------------------------*/
+void updateCadenceArray(long NewCrankRevolutions, long milliTimeStamp) {
+  for (int i = maxNumCrankObservations - 1; i> 0; i--){
+        crankRevolutionObservations[i] = crankRevolutionObservations[i - 1];
+        crankRevolutionObservationTimestamps[i] = crankRevolutionObservationTimestamps[i - 1];
+      }
+    crankRevolutionObservations[0] = NewCrankRevolutions;
+    crankRevolutionObservationTimestamps[0] = milliTimeStamp;
+}
+//*-------------------------------------------------------------------------------------------------------------
+void levelCrankData(long crankRevolutions, long milliSecValue) {
+  // set all observations and time stamps to the same value - which effectively means any requests for current
+  // cadence will return 0 rpm
+      for (int i = 0; i < maxNumCrankObservations; i++) {
+      crankRevolutionObservations[i] = crankRevolutions;
+      crankRevolutionObservationTimestamps[i] = milliSecValue;
+    }
+}
+/*---------------------------------------------------------------------------------------------*/
+int getCurrentCadence() {
+  // when cranking away, crank updates then to come in every 1/10 second or so,  so with maxNumCrankObservations = 12,
+  // you will be averaging across 1.2 seconds or so
+  if ((crankRevolutionObservationTimestamps[0] - crankRevolutionObservationTimestamps[maxNumCrankObservations-1]) > 0 ){
+    return int( (60 * 1000 * (crankRevolutionObservations[0] - crankRevolutionObservations[maxNumCrankObservations-1])) /
+               (crankRevolutionObservationTimestamps[0] - crankRevolutionObservationTimestamps[maxNumCrankObservations-1]));
+  } else {
+    return 0;
+  }
+}
 /*---------------------------------------------------------------------------------------------*/
 // roll second averages down, bumping off the older and adding the newest average second observation
 void updateAvgPowerArray(float newestAvgSec) {
@@ -967,15 +1243,15 @@ void updateAvgPowerArray(float newestAvgSec) {
     powerCumulativeTotalArray[avgInstant] += newestAvgSec;
   }
   for (int i = maxSecsToAvg - 1; i> 0; i--){
-        avgBySecond[i] = avgBySecond[i - 1];
+        avgPowerBySecond[i] = avgPowerBySecond[i - 1];
       }
-    avgBySecond[0] = newestAvgSec;
+    avgPowerBySecond[0] = newestAvgSec;
   // update the 3 second max, but only if all of the seconds spanned are non-zero
   int n =0;
   int p = 0;
   for (int i = 0; i < 3; i++) {
-    if (avgBySecond[i] > 0) n++;
-    p = p + avgBySecond[i];
+    if (avgPowerBySecond[i] > 0) n++;
+    p = p + avgPowerBySecond[i];
   }
   if (n == 3 ) {
     if (int(p/3) > maxPowerArray[avg3Secs]) maxPowerArray[avg3Secs] = int(p/3);
@@ -986,8 +1262,8 @@ void updateAvgPowerArray(float newestAvgSec) {
   p = 0;
   n = 0;
   for (int i = 0; i < 10; i++) {
-    if (avgBySecond[i] > 0) n++;
-    p = p + avgBySecond[i];
+    if (avgPowerBySecond[i] > 0) n++;
+    p = p + avgPowerBySecond[i];
   }
   if (n == 10) {
     if (int(p/10) > maxPowerArray[avg10Secs]) maxPowerArray[avg10Secs] = int(p/10);
@@ -998,12 +1274,6 @@ void updateAvgPowerArray(float newestAvgSec) {
 }
 /*------------------------------------------------------------------------------------------------------------*/
 void calcTileAndLock(uint8_t *pData, size_t length){
-  /*for (int i = 0; i < length; i++) {
-    //Serial.print(pData[i], HEX);
-    //Serial.print(" "); //separate values with a space
-  }
-  //Serial.println("");
-  */
     //lock, unlock update
   if(length == 3 && pData[0] == 0xfd && pData[1] == 0x33) {
     tilt_lock = pData[2] == 0x01;
@@ -1023,17 +1293,43 @@ void calcTileAndLock(uint8_t *pData, size_t length){
     }
   }
 }
+
 /*-------------------------------------------------------------------------------------------------------------
   These last sections handle the callbacks when bluetooth sends an updated power, grade, lock or gearing update
   Bad idea to have serial outputs in these routines, as these get called constantly and the serial write is 
   slow.    If you turn on debug output, turns them back off when finished.
 ------------------------------------------------------------------------------------------------------------*/
-static void notifyCallbackPower(BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify)
+static void notifyCallbackPowerAndCadence(BLERemoteCharacteristic *pBLERemoteCharacteristic, uint8_t *pData, size_t length, bool isNotify)
 {
   currentPower = (int)(pData[3] << 8 | pData[2]);
-  long currentSecond = long(millis()/1000);
-  if (currentPower > maxPowerArray[avgInstant]) maxPowerArray[avgInstant] = currentPower;
+  NewCrankRevolutions = pData[12] + pData[13]*256;
+  long currentMillis = long(millis());
+  long currentSecond = long(currentMillis/1000);
 
+  // Cadence / Crank logic ----------------------------------------------------------------------------------------------------
+  // this will only happen at start up
+  if (OldCrankRevolutions == 0) {
+    // init the crankRevolutionObservations array to the new crankrevolutions
+    levelCrankData(NewCrankRevolutions, currentMillis );
+    OldCrankRevolutions = NewCrankRevolutions;
+    //OldCrankTimeStampMillis = currentMillis;
+  }
+
+  
+  if (NewCrankRevolutions > OldCrankRevolutions) {
+    updateCadenceArray(NewCrankRevolutions, currentMillis);
+    OldCrankRevolutions = NewCrankRevolutions;
+    lastCadenceReadSecs = currentSecond;
+    //OldCrankTimeStampMillis = currentMillis;
+  } else if (currentSecond > lastCadenceReadSecs + 2) {
+    levelCrankData(NewCrankRevolutions, currentMillis );
+    lastCadenceReadSecs = currentSecond;
+    OldCrankRevolutions = NewCrankRevolutions;
+  }
+
+   // Power logic --------------------------------------------------------------------------------------------------------------
+  
+  if (currentPower > maxPowerArray[avgInstant]) maxPowerArray[avgInstant] = currentPower;
   if (currentPower > 0) {
     lastNonZeroPower = currentSecond;
     // are we still tracking within the "current" second - if so update intra second #s
@@ -1045,15 +1341,28 @@ static void notifyCallbackPower(BLERemoteCharacteristic *pBLERemoteCharacteristi
       
       if (intraSecondObservations > 0) {
         updateAvgPowerArray(intraSecondCumulativeTotal/intraSecondObservations);
+        // update appropriate bucket of secsInPowerZone[] array
+        int pctFTP = int(100 * intraSecondCumulativeTotal/intraSecondObservations/inputFTP );
+        int notFound = 1;
+        //Serial.println("notifyCallbackPowerAndCadence pctFTP:" + String(pctFTP));
+        for (int i = numPowerZones - 1; i >= 0; i--) {
+          if (pctFTP > powerZoneThreshold[i] && notFound == 1) {
+            secsInPowerZone[i]++;
+            notFound = 0;
+          }
+        }
+        //Serial.println("z1:" + String(secsInPowerZone[0] + " z2:" + String(secsInPowerZone[1])));
       } else {
         updateAvgPowerArray(0);
       }
+
       // reset intra second varaibles
       intraSecondObservations = 1;
       intraSecondCumulativeTotal = currentPower;
       lastPowerObservationSecond = currentSecond;
+
+      }
     }
-  }
 }
 /*------------------------------------------------------------------------------------------------------------*/
 static void notifyCallbackGrade(
@@ -1061,12 +1370,6 @@ static void notifyCallbackGrade(
   uint8_t* pData,
   size_t length,
   bool isNotify) {
-
-  //Serial.print("noty2 : ");
-  /*for(int i=0; i < length; i++) {
-    Serial.print(String(i)+":");
-    Serial.println(String(pData[i]));
-  }*/
 
   calcTileAndLock(pData, length); 
 }
